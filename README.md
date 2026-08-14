@@ -225,6 +225,7 @@ The system is designed to run locally without cloud spend.
 - [OpenAPI contract](api/openapi.yaml)
 - [Benchmark methodology](docs/benchmark-methodology.md)
 - [Operations walkthrough](docs/operations-walkthrough.md)
+- [Maintainer handoff](docs/HANDOFF.md)
 - [Evidence directory](results/README.md)
 
 ## Resume activation
