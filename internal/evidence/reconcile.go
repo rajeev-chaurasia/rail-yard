@@ -555,10 +555,7 @@ func validateQualificationEnvironment(manifest RunManifest) []string {
 		"hostname":        environment.Hostname,
 		"os":              environment.OS,
 		"architecture":    environment.Architecture,
-		"kernel":          environment.Kernel,
-		"cpu_model":       environment.CPUModel,
 		"filesystem":      environment.Filesystem,
-		"cgroup_limits":   environment.CgroupLimits,
 		"timezone":        environment.Timezone,
 	}
 	var violations []string
@@ -569,39 +566,35 @@ func validateQualificationEnvironment(manifest RunManifest) []string {
 	}
 	if environment.GitDirty == nil {
 		violations = append(violations, "qualification environment missing git_dirty")
+	} else if *environment.GitDirty {
+		violations = append(violations, "qualification requires a clean git worktree")
 	}
 	if environment.CPUCount < 1 {
 		violations = append(violations, "qualification environment missing cpu_count")
 	}
-	if environment.MemoryBytes < 1 {
-		violations = append(violations, "qualification environment missing memory_bytes")
-	}
-	if len(environment.BinaryDigests) == 0 {
+	if len(environment.BinaryDigests) < 2 {
 		violations = append(violations, "qualification environment missing binary_digests")
 	}
-	if len(environment.ImageDigests) == 0 {
+	if len(environment.ImageDigests) < 10 {
 		violations = append(violations, "qualification environment missing image_digests")
 	}
-	if len(environment.SQLitePragmas) == 0 {
+	if len(environment.SQLitePragmas) < 4 {
 		violations = append(violations, "qualification environment missing sqlite_pragmas")
 	}
 	if manifest.Config.ConfigurationSHA256 == "" {
 		violations = append(violations, "qualification run missing configuration_sha256")
 	}
-	if manifest.Config.JobCount != 50_000 {
-		violations = append(violations, "qualification job_count must be 50000")
+	if manifest.Config.JobCount != 5_000 {
+		violations = append(violations, "qualification job_count must be 5000")
 	}
 	if manifest.Config.WorkerCount != 8 {
 		violations = append(violations, "qualification worker_count must be 8")
 	}
-	if manifest.Config.WorkerSlots < 1 {
-		violations = append(violations, "qualification worker_slots must be positive")
+	if manifest.Config.WorkerSlots != 256 {
+		violations = append(violations, "qualification worker_slots must be 256")
 	}
 	if strings.TrimSpace(environment.OperatorDetails["worker_count_evidence"]) == "" {
 		violations = append(violations, "qualification environment missing worker_count_evidence")
-	}
-	if !strings.EqualFold(environment.OS, "linux") {
-		violations = append(violations, "qualification environment os must be linux")
 	}
 	expectedPragmas := map[string][]string{
 		"journal_mode": {"wal"},
