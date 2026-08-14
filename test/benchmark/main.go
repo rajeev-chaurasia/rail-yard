@@ -31,6 +31,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 	flags.StringVar(&options.composeFile, "compose-file", "deploy/compose.yaml", "Docker Compose file")
 	flags.StringVar(&options.projectPrefix, "project-prefix", "rail-yard-benchmark", "isolated Compose project prefix")
 	flags.StringVar(&options.output, "output", "artifacts/benchmark", "new suite artifact directory")
+	flags.BoolVar(&options.resume, "resume", false, "resume a suite from finalized run checkpoints")
 	flags.StringVar(&options.dockerExecutable, "docker", "docker", "Docker CLI executable")
 	flags.StringVar(&options.goExecutable, "go", "go", "Go executable used for benchmark commands")
 	flags.StringVar(&options.databasePath, "database-path", "/var/lib/railyard/railyard.db", "SQLite path in the server container")

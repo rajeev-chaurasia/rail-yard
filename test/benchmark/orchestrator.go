@@ -38,6 +38,7 @@ type orchestrationOptions struct {
 	composeFile       string
 	projectPrefix     string
 	output            string
+	resume            bool
 	dockerExecutable  string
 	goExecutable      string
 	databasePath      string
@@ -54,6 +55,42 @@ type orchestrationOptions struct {
 	requestTimeout    time.Duration
 	pollInterval      time.Duration
 }
+
+type runSpec struct {
+	name  string
+	phase evidence.RunPhase
+	seed  int64
+}
+
+type orchestrationCheckpoint struct {
+	SchemaVersion       int                          `json:"schema_version"`
+	Config              immutableOrchestrationConfig `json:"config"`
+	SelectedHostPort    int                          `json:"selected_host_port"`
+	ConfigurationSHA256 string                       `json:"configuration_sha256,omitempty"`
+}
+
+type immutableOrchestrationConfig struct {
+	ComposeFileSHA256 string        `json:"compose_file_sha256"`
+	ComposeFile       string        `json:"compose_file"`
+	ProjectPrefix     string        `json:"project_prefix"`
+	DockerExecutable  string        `json:"docker_executable"`
+	GoExecutable      string        `json:"go_executable"`
+	DatabasePath      string        `json:"database_path"`
+	Runs              int           `json:"runs"`
+	Jobs              int           `json:"jobs"`
+	Workers           int           `json:"workers"`
+	WorkerSlots       int           `json:"worker_slots"`
+	RequestedHostPort int           `json:"requested_host_port"`
+	SubmitConcurrency int           `json:"submit_concurrency"`
+	PollConcurrency   int           `json:"poll_concurrency"`
+	Seed              int64         `json:"seed"`
+	StartupTimeout    time.Duration `json:"startup_timeout_ns"`
+	DrainTimeout      time.Duration `json:"drain_timeout_ns"`
+	RequestTimeout    time.Duration `json:"request_timeout_ns"`
+	PollInterval      time.Duration `json:"poll_interval_ns"`
+}
+
+const orchestrationCheckpointFile = "orchestration-checkpoint.json"
 
 type commandRunner interface {
 	Run(context.Context, []string, string, ...string) ([]byte, error)
@@ -221,43 +258,61 @@ func orchestrate(
 	options orchestrationOptions,
 	runner commandRunner,
 	stdout io.Writer,
-) error {
+) (orchestrationErr error) {
 	if err := options.validate(); err != nil {
 		return err
 	}
 	if runner == nil {
 		return errors.New("command runner is nil")
 	}
-	if err := createNewDirectory(options.output); err != nil {
-		return err
-	}
-
-	hostPort, err := selectHostPort(options.hostPort)
+	checkpoint, err := prepareOrchestration(options)
 	if err != nil {
 		return err
 	}
-	options.hostPort = hostPort
-	type runSpec struct {
-		name  string
-		phase evidence.RunPhase
-		seed  int64
-	}
-	specifications := []runSpec{{
-		name:  "warmup",
-		phase: evidence.PhaseWarmup,
-		seed:  options.seed,
-	}}
-	for index := 1; index <= options.runs; index++ {
-		specifications = append(specifications, runSpec{
-			name:  fmt.Sprintf("measured-%02d", index),
-			phase: evidence.PhaseMeasured,
-			seed:  options.seed + int64(index),
-		})
-	}
+	options.hostPort = checkpoint.SelectedHostPort
 
+	suiteCompose := composeClient{
+		runner:     runner,
+		executable: options.dockerExecutable,
+		file:       options.composeFile,
+		project:    options.projectPrefix,
+		environment: []string{
+			"RAILYARD_HTTP_PORT=" + strconv.Itoa(options.hostPort),
+			"RAILYARD_WORKER_SLOTS=" + strconv.Itoa(options.workerSlots),
+			"RAILYARD_LEASE_TTL=10s",
+		},
+	}
+	defer func() {
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := suiteCompose.down(cleanupContext); err != nil {
+			orchestrationErr = errors.Join(orchestrationErr, fmt.Errorf("remove suite Compose resources: %w", err))
+		}
+	}()
+
+	specifications := runSpecifications(options)
 	runDirectories := make([]string, 0, len(specifications))
 	for _, specification := range specifications {
 		directory := filepath.Join(options.output, "runs", specification.name)
+		if options.resume {
+			reusable, configurationHash, err := inspectResumableRun(
+				options,
+				specification,
+				directory,
+				checkpoint.ConfigurationSHA256,
+			)
+			if err != nil {
+				return err
+			}
+			if reusable {
+				if err := bindConfigurationHash(options.output, &checkpoint, configurationHash); err != nil {
+					return err
+				}
+				runDirectories = append(runDirectories, directory)
+				_, _ = fmt.Fprintf(stdout, "resuming after completed %s run\n", specification.name)
+				continue
+			}
+		}
 		_, _ = fmt.Fprintf(stdout, "starting %s run\n", specification.name)
 		err := runComposeBenchmark(
 			ctx,
@@ -272,9 +327,25 @@ func orchestrate(
 			_ = evidence.GenerateChecksums(options.output)
 			return fmt.Errorf("%s run: %w", specification.name, err)
 		}
+		_, configurationHash, err := inspectFinalizedRun(
+			options,
+			specification,
+			directory,
+			checkpoint.ConfigurationSHA256,
+		)
+		if err != nil {
+			_ = evidence.GenerateChecksums(options.output)
+			return fmt.Errorf("%s finalized evidence: %w", specification.name, err)
+		}
+		if err := bindConfigurationHash(options.output, &checkpoint, configurationHash); err != nil {
+			return err
+		}
 		runDirectories = append(runDirectories, directory)
 	}
 
+	if err := os.RemoveAll(filepath.Join(options.output, "suite")); err != nil {
+		return fmt.Errorf("remove previous suite summary: %w", err)
+	}
 	if err := summarizeOrchestration(
 		ctx,
 		options,
@@ -291,6 +362,321 @@ func orchestrate(
 		return fmt.Errorf("verify suite checksums: %w", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "benchmark artifacts written to %s\n", options.output)
+	return nil
+}
+
+func prepareOrchestration(options orchestrationOptions) (orchestrationCheckpoint, error) {
+	config, err := immutableConfig(options)
+	if err != nil {
+		return orchestrationCheckpoint{}, err
+	}
+	checkpointPath := filepath.Join(options.output, orchestrationCheckpointFile)
+	if options.resume {
+		var checkpoint orchestrationCheckpoint
+		if err := evidence.ReadJSON(checkpointPath, &checkpoint); err != nil {
+			return checkpoint, fmt.Errorf("read resume checkpoint: %w", err)
+		}
+		if checkpoint.SchemaVersion != evidence.SchemaVersion {
+			return checkpoint, fmt.Errorf("resume checkpoint schema version is %d, want %d",
+				checkpoint.SchemaVersion, evidence.SchemaVersion)
+		}
+		if checkpoint.Config != config {
+			return checkpoint, errors.New("resume configuration does not match the checkpoint")
+		}
+		if checkpoint.SelectedHostPort < 1 || checkpoint.SelectedHostPort > 65535 {
+			return checkpoint, errors.New("resume checkpoint has an invalid selected host port")
+		}
+		return checkpoint, nil
+	}
+
+	if err := createNewDirectory(options.output); err != nil {
+		return orchestrationCheckpoint{}, err
+	}
+	hostPort, err := selectHostPort(options.hostPort)
+	if err != nil {
+		return orchestrationCheckpoint{}, err
+	}
+	checkpoint := orchestrationCheckpoint{
+		SchemaVersion:    evidence.SchemaVersion,
+		Config:           config,
+		SelectedHostPort: hostPort,
+	}
+	if err := evidence.WriteJSON(checkpointPath, checkpoint); err != nil {
+		return orchestrationCheckpoint{}, fmt.Errorf("write orchestration checkpoint: %w", err)
+	}
+	return checkpoint, nil
+}
+
+func immutableConfig(options orchestrationOptions) (immutableOrchestrationConfig, error) {
+	composeFile, err := filepath.Abs(options.composeFile)
+	if err != nil {
+		return immutableOrchestrationConfig{}, fmt.Errorf("resolve compose file: %w", err)
+	}
+	composeDigest, err := evidence.FileSHA256(composeFile)
+	if err != nil {
+		return immutableOrchestrationConfig{}, fmt.Errorf("hash compose file: %w", err)
+	}
+	return immutableOrchestrationConfig{
+		ComposeFileSHA256: composeDigest,
+		ComposeFile:       filepath.Clean(composeFile),
+		ProjectPrefix:     options.projectPrefix,
+		DockerExecutable:  options.dockerExecutable,
+		GoExecutable:      options.goExecutable,
+		DatabasePath:      options.databasePath,
+		Runs:              options.runs,
+		Jobs:              options.jobs,
+		Workers:           options.workers,
+		WorkerSlots:       options.workerSlots,
+		RequestedHostPort: options.hostPort,
+		SubmitConcurrency: options.submitConcurrency,
+		PollConcurrency:   options.pollConcurrency,
+		Seed:              options.seed,
+		StartupTimeout:    options.startupTimeout,
+		DrainTimeout:      options.drainTimeout,
+		RequestTimeout:    options.requestTimeout,
+		PollInterval:      options.pollInterval,
+	}, nil
+}
+
+func runSpecifications(options orchestrationOptions) []runSpec {
+	specifications := []runSpec{{
+		name:  "warmup",
+		phase: evidence.PhaseWarmup,
+		seed:  options.seed,
+	}}
+	for index := 1; index <= options.runs; index++ {
+		specifications = append(specifications, runSpec{
+			name:  fmt.Sprintf("measured-%02d", index),
+			phase: evidence.PhaseMeasured,
+			seed:  options.seed + int64(index),
+		})
+	}
+	return specifications
+}
+
+func inspectResumableRun(
+	options orchestrationOptions,
+	specification runSpec,
+	directory string,
+	configurationHash string,
+) (bool, string, error) {
+	info, err := os.Stat(directory)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := quarantineIncompleteRun(options.output, specification.name); err != nil {
+			return false, "", err
+		}
+		return false, "", nil
+	case err != nil:
+		return false, "", fmt.Errorf("inspect %s run directory: %w", specification.name, err)
+	case !info.IsDir():
+		return false, "", fmt.Errorf("%s run path is not a directory", specification.name)
+	}
+
+	var manifest evidence.RunManifest
+	manifestErr := evidence.ReadJSON(filepath.Join(directory, "manifest.json"), &manifest)
+	if manifestErr == nil && manifest.Status == evidence.StatusValid {
+		return inspectFinalizedRun(options, specification, directory, configurationHash)
+	}
+	if manifestErr != nil && evidence.VerifyChecksums(directory) == nil {
+		return false, "", fmt.Errorf("%s run has checksummed but unreadable manifest: %w",
+			specification.name, manifestErr)
+	}
+	if err := quarantineIncompleteRun(options.output, specification.name); err != nil {
+		return false, "", err
+	}
+	return false, "", nil
+}
+
+func inspectFinalizedRun(
+	options orchestrationOptions,
+	specification runSpec,
+	directory string,
+	configurationHash string,
+) (bool, string, error) {
+	for _, name := range []string{
+		"manifest.json",
+		"submitted.jsonl",
+		"drain-samples.jsonl",
+		"reconciliation.json",
+		"benchmark-samples.jsonl",
+		"benchmark-summary.json",
+	} {
+		if _, err := evidence.FileSHA256(filepath.Join(directory, name)); err != nil {
+			return false, "", fmt.Errorf("%s required artifact %s: %w", specification.name, name, err)
+		}
+	}
+	if err := evidence.VerifyChecksums(directory); err != nil {
+		return false, "", fmt.Errorf("%s run checksum verification failed: %w", specification.name, err)
+	}
+	var manifest evidence.RunManifest
+	if err := evidence.ReadJSON(filepath.Join(directory, "manifest.json"), &manifest); err != nil {
+		return false, "", fmt.Errorf("read %s manifest: %w", specification.name, err)
+	}
+	var summary evidence.BenchmarkSummary
+	if err := evidence.ReadJSON(filepath.Join(directory, "benchmark-summary.json"), &summary); err != nil {
+		return false, "", fmt.Errorf("read %s summary: %w", specification.name, err)
+	}
+	var reconciliation evidence.ReconciliationReport
+	if err := evidence.ReadJSON(filepath.Join(directory, "reconciliation.json"), &reconciliation); err != nil {
+		return false, "", fmt.Errorf("read %s reconciliation: %w", specification.name, err)
+	}
+	samples, err := evidence.ReadJSONLines[evidence.BenchmarkSample](
+		filepath.Join(directory, "benchmark-samples.jsonl"),
+	)
+	if err != nil {
+		return false, "", fmt.Errorf("read %s benchmark samples: %w", specification.name, err)
+	}
+
+	if manifest.SchemaVersion != evidence.SchemaVersion ||
+		manifest.Status != evidence.StatusValid ||
+		manifest.FinalizedAt == nil ||
+		manifest.WorkloadFinishedAt == nil ||
+		!manifest.DatabaseQuiesced ||
+		manifest.DatabaseSHA256 == "" ||
+		manifest.DatabaseFilesSHA256["database"] != manifest.DatabaseSHA256 {
+		return false, "", fmt.Errorf("%s manifest is not finalized and valid", specification.name)
+	}
+	if manifest.Phase != specification.phase ||
+		manifest.Scored != (specification.phase == evidence.PhaseMeasured) {
+		return false, "", fmt.Errorf("%s manifest phase does not match the requested run", specification.name)
+	}
+	if err := validateRunConfig(options, specification, manifest.Config, configurationHash); err != nil {
+		return false, "", fmt.Errorf("%s configuration mismatch: %w", specification.name, err)
+	}
+	if !summary.Valid ||
+		summary.SchemaVersion != evidence.SchemaVersion ||
+		summary.RunID != manifest.RunID ||
+		summary.Phase != manifest.Phase ||
+		summary.CanonicalJobCount != options.jobs ||
+		len(samples) != options.jobs {
+		return false, "", fmt.Errorf("%s benchmark summary is not finalized and valid", specification.name)
+	}
+	if !reconciliation.Passed ||
+		reconciliation.SchemaVersion != evidence.SchemaVersion ||
+		reconciliation.RunID != manifest.RunID {
+		return false, "", fmt.Errorf("%s reconciliation is not finalized and valid", specification.name)
+	}
+	sampleJobs := make(map[string]struct{}, len(samples))
+	for _, sample := range samples {
+		if sample.SchemaVersion != evidence.SchemaVersion ||
+			sample.RunID != manifest.RunID ||
+			sample.CompletionState != "SUCCEEDED" ||
+			sample.TimestampSource != "quiesced_sqlite_snapshot" {
+			return false, "", fmt.Errorf("%s benchmark samples have incompatible identity", specification.name)
+		}
+		if _, duplicate := sampleJobs[sample.JobID]; duplicate {
+			return false, "", fmt.Errorf("%s benchmark samples repeat job %s", specification.name, sample.JobID)
+		}
+		sampleJobs[sample.JobID] = struct{}{}
+	}
+	return true, manifest.Config.ConfigurationSHA256, nil
+}
+
+func validateRunConfig(
+	options orchestrationOptions,
+	specification runSpec,
+	config evidence.RunConfig,
+	configurationHash string,
+) error {
+	expectedServerURL := "http://127.0.0.1:" + strconv.Itoa(options.hostPort)
+	switch {
+	case config.ServerURL != expectedServerURL:
+		return errors.New("server URL differs")
+	case config.JobCount != options.jobs:
+		return errors.New("job count differs")
+	case config.WorkerCount != options.workers:
+		return errors.New("worker count differs")
+	case config.WorkerSlots != options.workerSlots:
+		return errors.New("worker slots differ")
+	case config.SubmitConcurrency != options.submitConcurrency:
+		return errors.New("submission concurrency differs")
+	case config.PollConcurrency != options.pollConcurrency:
+		return errors.New("polling concurrency differs")
+	case config.SubmissionAttempts != 3:
+		return errors.New("submission attempts differ")
+	case config.RequestTimeout != options.requestTimeout:
+		return errors.New("request timeout differs")
+	case config.HealthTimeout != options.startupTimeout:
+		return errors.New("health timeout differs")
+	case config.DrainTimeout != options.drainTimeout:
+		return errors.New("drain timeout differs")
+	case config.PollInterval != options.pollInterval:
+		return errors.New("poll interval differs")
+	case config.TenantID != "benchmark" || config.Queue != "benchmark":
+		return errors.New("tenant or queue differs")
+	case config.PayloadBytes < 1 || config.PayloadSHA256 == "":
+		return errors.New("fixed workload identity is missing")
+	case config.ConfigurationSHA256 == "":
+		return errors.New("rendered Compose configuration digest is missing")
+	case configurationHash != "" && config.ConfigurationSHA256 != configurationHash:
+		return errors.New("rendered Compose configuration digest differs")
+	case config.Seed != specification.seed:
+		return errors.New("seed differs")
+	case config.Qualification != options.qualification():
+		return errors.New("qualification mode differs")
+	}
+	return nil
+}
+
+func bindConfigurationHash(
+	output string,
+	checkpoint *orchestrationCheckpoint,
+	configurationHash string,
+) error {
+	if checkpoint.ConfigurationSHA256 != "" {
+		if checkpoint.ConfigurationSHA256 != configurationHash {
+			return errors.New("rendered Compose configuration changed between runs")
+		}
+		return nil
+	}
+	checkpoint.ConfigurationSHA256 = configurationHash
+	if err := evidence.WriteJSON(filepath.Join(output, orchestrationCheckpointFile), checkpoint); err != nil {
+		return fmt.Errorf("update orchestration checkpoint: %w", err)
+	}
+	return nil
+}
+
+func quarantineIncompleteRun(output, name string) error {
+	sources := []struct {
+		kind string
+		path string
+	}{
+		{kind: "runs", path: filepath.Join(output, "runs", name)},
+		{kind: "captures", path: filepath.Join(output, "captures", name)},
+		{kind: "snapshots", path: filepath.Join(output, "snapshots", name)},
+	}
+	var existing []struct {
+		kind string
+		path string
+	}
+	for _, source := range sources {
+		_, err := os.Lstat(source.path)
+		switch {
+		case err == nil:
+			existing = append(existing, source)
+		case errors.Is(err, os.ErrNotExist):
+		default:
+			return fmt.Errorf("inspect incomplete %s artifacts: %w", name, err)
+		}
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+
+	quarantine := filepath.Join(
+		filepath.Clean(output)+"-discarded",
+		name+"-"+time.Now().UTC().Format("20060102T150405.000000000Z"),
+	)
+	for _, source := range existing {
+		destination := filepath.Join(quarantine, source.kind)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			return fmt.Errorf("create incomplete run quarantine: %w", err)
+		}
+		if err := os.Rename(source.path, destination); err != nil {
+			return fmt.Errorf("quarantine incomplete %s artifacts: %w", name, err)
+		}
+	}
 	return nil
 }
 

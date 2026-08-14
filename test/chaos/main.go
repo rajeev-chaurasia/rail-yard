@@ -57,6 +57,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags.DurationVar(&cfg.RequestTimeout, "request-timeout", 10*time.Second, "individual HTTP request timeout")
 	flags.DurationVar(&cfg.MaxRecovery, "max-recovery", 5*time.Second, "strict worker recovery p99 ceiling")
 	flags.BoolVar(&cfg.KeepStack, "keep-stack", false, "keep a successful stopped stack and volume")
+	flags.BoolVar(&cfg.Resume, "resume", false, "reuse verified completed runs")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

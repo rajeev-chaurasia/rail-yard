@@ -21,6 +21,28 @@ go run ./test/benchmark \
   --output results/throughput/<suite-directory>
 ```
 
+Resume an interrupted suite with the same immutable options and output
+directory:
+
+```sh
+go run ./test/benchmark \
+  --resume \
+  --compose-file deploy/compose.yaml \
+  --project-prefix railyard-benchmark \
+  --runs 3 \
+  --jobs 50000 \
+  --workers 8 \
+  --worker-slots 256 \
+  --output results/throughput/<suite-directory>
+```
+
+Resume verifies the orchestration checkpoint and every completed run's
+checksums, finalized manifest, reconciliation, summary, and sample count. It
+reuses only valid runs with the requested configuration. An incomplete current
+run is quarantined and restarted, and the suite summary is always regenerated.
+Changed configuration or corrupted completed evidence stops the resume.
+Partial timing data is never included in the summary.
+
 Build the tool once on the qualification host:
 
 ```sh

@@ -56,6 +56,7 @@ type config struct {
 	RequestTimeout    time.Duration
 	MaxRecovery       time.Duration
 	KeepStack         bool
+	Resume            bool
 }
 
 type campaignSummary struct {
@@ -103,6 +104,7 @@ type runManifest struct {
 	ServerKillTargetJobs int           `json:"server_kill_target_jobs"`
 	MaxRecovery          time.Duration `json:"max_recovery"`
 	ComposeFile          string        `json:"compose_file"`
+	ConfigurationHash    string        `json:"configuration_hash"`
 	StartedAt            time.Time     `json:"started_at"`
 	CompletedAt          time.Time     `json:"completed_at,omitempty"`
 }
@@ -452,14 +454,36 @@ func (c submissionClient) submit(
 }
 
 func runCampaign(ctx context.Context, cfg config, runner commandRunner) (campaignSummary, error) {
+	return runCampaignWithExecutor(ctx, cfg, runner, runOnce)
+}
+
+type runExecutor func(context.Context, config, commandRunner, int, int64) (runSummary, error)
+
+func runCampaignWithExecutor(
+	ctx context.Context,
+	cfg config,
+	runner commandRunner,
+	execute runExecutor,
+) (campaignSummary, error) {
 	if err := cfg.validate(); err != nil {
 		return campaignSummary{}, err
 	}
 	if runner == nil {
 		return campaignSummary{}, errors.New("command runner is nil")
 	}
+	if execute == nil {
+		return campaignSummary{}, errors.New("run executor is nil")
+	}
 	if err := os.MkdirAll(cfg.OutputDirectory, 0o755); err != nil {
 		return campaignSummary{}, fmt.Errorf("create output directory: %w", err)
+	}
+	completed := make(map[int]runSummary)
+	if cfg.Resume {
+		var err error
+		completed, err = loadResumedRuns(cfg)
+		if err != nil {
+			return campaignSummary{}, err
+		}
 	}
 	summary := campaignSummary{
 		Version:          1,
@@ -470,7 +494,11 @@ func runCampaign(ctx context.Context, cfg config, runner commandRunner) (campaig
 	}
 	var recoveryValues []float64
 	for run := 1; run <= cfg.Runs; run++ {
-		runResult, err := runOnce(ctx, cfg, runner, run, cfg.BaseSeed+int64(run-1))
+		runResult, found := completed[run]
+		var err error
+		if !found {
+			runResult, err = execute(ctx, cfg, runner, run, cfg.BaseSeed+int64(run-1))
+		}
 		summary.Runs = append(summary.Runs, runResult)
 		recoveryValues = append(recoveryValues, runResult.recoveryValues...)
 		if err != nil {
@@ -565,8 +593,12 @@ func runOnce(
 	random := rand.New(rand.NewSource(seed))
 	targetFraction := 0.25 + random.Float64()*0.40
 	targetJobs := max(1, int(math.Ceil(targetFraction*float64(cfg.Jobs))))
+	configurationHash, err := cfg.configurationHash()
+	if err != nil {
+		return result, err
+	}
 	manifest := runManifest{
-		Version:              1,
+		Version:              2,
 		Run:                  run,
 		Seed:                 seed,
 		Project:              project,
@@ -581,6 +613,7 @@ func runOnce(
 		ServerKillTargetJobs: targetJobs,
 		MaxRecovery:          cfg.MaxRecovery,
 		ComposeFile:          cfg.ComposeFile,
+		ConfigurationHash:    configurationHash,
 		StartedAt:            result.StartedAt,
 	}
 	if err := writeJSONAtomic(filepath.Join(runDirectory, "manifest.json"), manifest); err != nil {
@@ -767,6 +800,9 @@ func runOnce(
 
 	manifest.CompletedAt = time.Now().UTC()
 	if err := writeJSONAtomic(filepath.Join(runDirectory, "manifest.json"), manifest); err != nil {
+		return result, err
+	}
+	if err := finalizeRunArtifacts(runDirectory, cfg); err != nil {
 		return result, err
 	}
 	return result, nil
