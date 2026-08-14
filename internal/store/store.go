@@ -14,12 +14,14 @@ var ErrWorkerCapacityConflict = errors.New("worker capacity conflicts with durab
 
 type Submission struct {
 	Job            domain.JobSpec
+	Actor          string
 	IdempotencyKey string
 	RequestDigest  string
 }
 
 type WorkflowSubmission struct {
 	Request        api.SubmitWorkflowRequest
+	Actor          string
 	IdempotencyKey string
 	RequestDigest  string
 }
@@ -83,6 +85,7 @@ type RecoveryAwareStore interface {
 
 type CronSubmission struct {
 	Trigger        domain.CronTrigger
+	Actor          string
 	IdempotencyKey string
 	RequestDigest  string
 }
@@ -102,4 +105,17 @@ type DeadLetterStore interface {
 		string,
 		time.Time,
 	) (domain.Job, bool, error)
+}
+
+type actorContextKey struct{}
+
+// WithActor carries an attributed actor through store decorators.
+func WithActor(ctx context.Context, actor string) context.Context {
+	return context.WithValue(ctx, actorContextKey{}, actor)
+}
+
+// ActorFromContext returns the attributed store actor.
+func ActorFromContext(ctx context.Context) string {
+	actor, _ := ctx.Value(actorContextKey{}).(string)
+	return actor
 }

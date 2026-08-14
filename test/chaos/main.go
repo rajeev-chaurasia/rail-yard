@@ -42,8 +42,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		"SQLite path inside the server container",
 	)
 	flags.StringVar(&cfg.DockerExecutable, "docker", "docker", "Docker CLI executable")
-	flags.IntVar(&cfg.Runs, "runs", 1, "number of fresh-volume runs")
-	flags.IntVar(&cfg.Jobs, "jobs", 1000, "exact accepted jobs per run")
+	flags.IntVar(&cfg.Runs, "runs", defaultRuns, "number of fresh-volume runs")
+	flags.IntVar(&cfg.Jobs, "jobs", defaultJobs, "exact accepted jobs per run")
 	flags.Int64Var(&cfg.BaseSeed, "seed", 1, "deterministic base seed")
 	flags.IntVar(&cfg.SubmitConcurrency, "submit-concurrency", 16, "concurrent idempotent submitters")
 	flags.IntVar(&cfg.WorkerKills, "worker-kills", defaultWorkerKills, "SIGKILL actions per run")

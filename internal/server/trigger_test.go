@@ -65,6 +65,7 @@ func TestCreateCronTrigger(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 	if captured.IdempotencyKey != "cron-key" ||
+		captured.Actor != "test-actor" ||
 		captured.Trigger.TenantID != "tenant" ||
 		captured.Trigger.Job.Queue != "cron" {
 		t.Fatalf("captured submission = %+v", captured)

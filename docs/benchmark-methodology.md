@@ -19,14 +19,20 @@ size, configuration hash, timezone, and random seed.
 SQLite uses a fresh Docker named volume for each scored run. Source code may be
 stored in a synchronized directory, but the live WAL database may not.
 
+## Reduced portfolio scope
+
+The final portfolio qualification is deliberately bounded to fit about one hour
+on the documented host. It does not qualify a 50,000-job benchmark or a ten-run,
+50,000-job chaos campaign.
+
 ## Throughput
 
-The workload contains 50,000 independent no-op jobs with fixed serialized
-payload size, one tenant, one queue, and slot cost one. Eight workers use the
-same frozen capacity of 256 slots each for all throughput runs. Chaos runs use
-the reference 16-slot worker configuration. Throughput runs use a 10-second
-lease to absorb high-concurrency heartbeat latency; recovery qualification uses
-the default 2.5-second lease.
+Each workload contains exactly 5,000 independent no-op jobs with fixed
+serialized payload size, one tenant, one queue, and slot cost one. Eight workers
+use the same frozen capacity of 256 slots each for all throughput runs. Chaos
+runs use the reference 16-slot worker configuration. Throughput runs use a
+10-second lease to absorb high-concurrency heartbeat latency; recovery
+qualification uses the default 2.5-second lease.
 
 Report these rates separately:
 
@@ -55,14 +61,14 @@ runners execute only smoke coverage and do not create résumé evidence.
 
 ## Chaos campaign
 
-Each of ten runs uses a fresh volume, a recorded seed, and exactly 50,000
-accepted no-op jobs.
+One run uses a fresh volume, a recorded seed, and exactly 5,000 accepted no-op
+jobs.
 
 While work remains, the controller:
 
 - sends `SIGKILL` to a uniformly selected live worker at deterministic seeded
   intervals;
-- performs at least twenty worker kills per run;
+- performs exactly 20 worker kills;
 - restarts each worker with the same slot capacity;
 - sends one `SIGKILL` to the server between 20% and 80% progress; and
 - restarts the server against the same SQLite volume.
@@ -87,19 +93,19 @@ controller's confirmed kill timestamp:
 recovery = successor_lease_committed_at - worker_kill_confirmed_at
 ```
 
-Use the nearest-rank p99 over all samples from the ten runs. Publish the full
-sample set. The target is p99 below five seconds.
+Use the nearest-rank p99 over every sample from the run. Publish the full sample
+set, the p99, and the sample count. The target is p99 below five seconds.
 
 Server recovery is reported as the later of readiness restoration and the first
-post-restart durable lease. Ten server kills are insufficient for a meaningful
-p99, so this value is reported as a maximum rather than folded into the worker
+post-restart durable lease. One server kill is insufficient for a meaningful
+p99, so this value is reported separately rather than folded into the worker
 recovery target.
 
 ## Deterministic replay
 
-Use a captured stream containing at least 50,000 scheduler decisions. Start
-three clean replay processes from the same input. Each writes canonical UTF-8
-JSONL and a SHA-256 digest.
+Use a captured stream containing exactly 50,000 scheduler decisions. Start
+three separate operating system replay processes from the same input. Each
+writes canonical UTF-8 JSONL and a SHA-256 digest.
 
 The test passes only when all three outputs are byte-identical to the captured
 canonical decisions and all four digests match. Database, WAL, archive, and
@@ -124,8 +130,9 @@ run shape.
 
 The exact commands, resume behavior, and required files are documented in
 [`results/README.md`](../results/README.md). Missing required artifacts,
-non-final manifests, checksum failures, skipped live P5 alerts, or invalid
-reconciliation invalidate a scored result.
+non-final manifests, checksum failures, missing deterministic promtool
+fire-and-recovery evidence, or invalid reconciliation invalidate a scored
+result.
 
 Random seeds, exact action traces, and failure output are always preserved.
 Tests use predicate polling with deadlines, never fixed readiness sleeps. A
@@ -140,6 +147,8 @@ README and resume claims include:
 - no-op workload;
 - one host;
 - eight workers;
+- exactly 5,000 jobs per benchmark run;
+- one 5,000-job chaos run;
 - the number of runs and aggregation; and
 - a link to the raw evidence directory.
 

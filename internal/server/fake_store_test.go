@@ -41,8 +41,16 @@ type fakeStore struct {
 		[]domain.Completion,
 		time.Time,
 	) ([]store.CompletionResult, error)
-	promoteDue func(context.Context, time.Time, int) (int, error)
-	reap       func(context.Context, time.Time, int) ([]domain.ReapedLease, error)
+	promoteDue        func(context.Context, time.Time, int) (int, error)
+	reap              func(context.Context, time.Time, int) ([]domain.ReapedLease, error)
+	listDeadLetters   func(context.Context, int) ([]domain.DeadLetter, error)
+	redriveDeadLetter func(
+		context.Context,
+		string,
+		string,
+		string,
+		time.Time,
+	) (domain.Job, bool, error)
 
 	closeMu    sync.Mutex
 	closeCalls int
@@ -198,6 +206,29 @@ func (f *fakeStore) ReapExpired(
 		return nil, nil
 	}
 	return f.reap(ctx, now, limit)
+}
+
+func (f *fakeStore) ListDeadLetters(
+	ctx context.Context,
+	limit int,
+) ([]domain.DeadLetter, error) {
+	if f.listDeadLetters == nil {
+		return []domain.DeadLetter{}, nil
+	}
+	return f.listDeadLetters(ctx, limit)
+}
+
+func (f *fakeStore) RedriveDeadLetter(
+	ctx context.Context,
+	jobID string,
+	key string,
+	digest string,
+	now time.Time,
+) (domain.Job, bool, error) {
+	if f.redriveDeadLetter == nil {
+		return domain.Job{}, false, nil
+	}
+	return f.redriveDeadLetter(ctx, jobID, key, digest, now)
 }
 
 func (f *fakeStore) Close() error {

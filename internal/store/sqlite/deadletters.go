@@ -72,6 +72,10 @@ func (s *Store) RedriveDeadLetter(
 	releaseWrite := s.beginWrite(writeNormal)
 	defer releaseWrite()
 	now = s.writeTime(now)
+	actor := storepkg.ActorFromContext(ctx)
+	if actor == "" {
+		actor = "api"
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Job{}, false, fmt.Errorf("begin dead-letter redrive: %w", err)
@@ -132,6 +136,24 @@ func (s *Store) RedriveDeadLetter(
 	}
 	result, err := tx.ExecContext(
 		ctx,
+		`UPDATE events
+		 SET payload_json = CAST(json_set(payload_json, '$.actor', ?) AS BLOB)
+		 WHERE job_id = ? AND event_type = 'job_admitted'`,
+		actor,
+		created.ID,
+	)
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("attribute redriven job admission: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("inspect redriven job admission: %w", err)
+	}
+	if affected != 1 {
+		return domain.Job{}, false, errors.New("redriven job admission event is missing")
+	}
+	result, err = tx.ExecContext(
+		ctx,
 		`UPDATE dead_letters
 		 SET redriven_job_id = ?
 		 WHERE job_id = ? AND redriven_job_id IS NULL`,
@@ -141,14 +163,14 @@ func (s *Store) RedriveDeadLetter(
 	if err != nil {
 		return domain.Job{}, false, fmt.Errorf("link redriven job: %w", err)
 	}
-	affected, err := result.RowsAffected()
+	affected, err = result.RowsAffected()
 	if err != nil {
 		return domain.Job{}, false, fmt.Errorf("inspect redrive link: %w", err)
 	}
 	if affected != 1 {
 		return domain.Job{}, false, domain.ErrDeadLetterRedriven
 	}
-	if err := appendEvent(
+	if err := appendActorEvent(
 		ctx,
 		tx,
 		jobID,
@@ -156,16 +178,25 @@ func (s *Store) RedriveDeadLetter(
 		original.State,
 		original.StateVersion,
 		now,
-		map[string]any{"actor": "api", "created_job_id": created.ID},
+		map[string]any{"actor": actor, "created_job_id": created.ID},
 	); err != nil {
 		return domain.Job{}, false, err
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE events
+		 SET payload_json = CAST(payload_json AS BLOB)
+		 WHERE job_id = ? AND typeof(payload_json) = 'text'`,
+		jobID,
+	); err != nil {
+		return domain.Job{}, false, fmt.Errorf("normalize redrive history payloads: %w", err)
 	}
 	response := api.RedriveDeadLetterResponse{Job: created}
 	if err := insertControlAction(ctx, tx, ControlAction{
 		TenantID:       original.TenantID,
 		IdempotencyKey: idempotencyKey,
 		Action:         actionName,
-		Actor:          "api",
+		Actor:          actor,
 		RequestDigest:  requestDigest,
 		CommittedAt:    now,
 		TargetType:     "dead_letter",
@@ -173,7 +204,7 @@ func (s *Store) RedriveDeadLetter(
 		TargetState:    created.State,
 		TargetVersion:  created.StateVersion,
 		Response:       response,
-		Details:        map[string]string{"created_job_id": created.ID},
+		Details:        map[string]string{"actor": actor, "created_job_id": created.ID},
 	}); err != nil {
 		return domain.Job{}, false, err
 	}

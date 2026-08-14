@@ -250,7 +250,7 @@ func (o orchestrationOptions) validate() error {
 }
 
 func (o orchestrationOptions) qualification() bool {
-	return o.runs == 3 && o.jobs == 50_000 && o.workers == 8
+	return o.runs == 3 && o.jobs == 5_000 && o.workers == 8 && o.workerSlots == 256
 }
 
 func orchestrate(

@@ -52,7 +52,7 @@ jobs:
           fi
 
   chaos:
-    name: Full 10 x 50k chaos
+    name: Reduced portfolio chaos, 1 x 5k
     if: ${{ inputs.suite == 'all' || inputs.suite == 'chaos' }}
     needs: validate
     runs-on:
@@ -60,7 +60,7 @@ jobs:
       - linux
       - x64
       - rail-yard-qualification
-    timeout-minutes: 360
+    timeout-minutes: 60
     env:
       CHAOS_OUTPUT: artifacts/qualification/chaos-${{ github.run_id }}
     steps:
@@ -83,8 +83,8 @@ jobs:
           go run -mod=readonly ./test/chaos
           --resume
           --project-prefix=rail-yard-qualification-chaos-${{ github.run_id }}
-          --runs=10
-          --jobs=50000
+          --runs=1
+          --jobs=5000
           --worker-kills=20
           --job-duration=250ms
           --action-min=100ms
@@ -102,7 +102,7 @@ jobs:
           retention-days: 30
 
   benchmark:
-    name: Three-run benchmark
+    name: Reduced portfolio benchmark, 3 x 5k
     if: ${{ inputs.suite == 'all' || inputs.suite == 'benchmark' }}
     needs: validate
     runs-on:
@@ -110,7 +110,7 @@ jobs:
       - linux
       - x64
       - rail-yard-qualification
-    timeout-minutes: 240
+    timeout-minutes: 45
     env:
       BENCHMARK_OUTPUT: artifacts/qualification/benchmark-${{ github.run_id }}
     steps:
@@ -136,7 +136,7 @@ jobs:
             "${resume_args[@]}" \
             --project-prefix=rail-yard-qualification-benchmark-${{ github.run_id }} \
             --runs=3 \
-            --jobs=50000 \
+            --jobs=5000 \
             --workers=8 \
             --worker-slots=256 \
             --output="$BENCHMARK_OUTPUT"
@@ -151,7 +151,7 @@ jobs:
           retention-days: 30
 
   p5:
-    name: Operations lifecycle and SLOs
+    name: Live operations lifecycle and rule tests
     if: ${{ inputs.suite == 'all' || inputs.suite == 'p5' }}
     needs: validate
     runs-on:
@@ -159,7 +159,7 @@ jobs:
       - linux
       - x64
       - rail-yard-qualification
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       COMPOSE_PROJECT: rail-yard-p5-${{ github.run_id }}-${{ github.run_attempt }}
       RAILYARD_HTTP_PORT: "18081"
@@ -194,7 +194,7 @@ jobs:
           --compose-project="$COMPOSE_PROJECT"
           --slo-rule-evidence=slo-summary.json
           --output=artifacts/qualification/p5/walkthrough.json
-          --timeout=35m
+          --timeout=25m
 
       - name: Stop P5 stack
         if: ${{ always() }}

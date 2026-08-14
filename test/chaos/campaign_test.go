@@ -24,7 +24,18 @@ func TestConfigRequiresQualificationChaosMinimum(t *testing.T) {
 	cfg := validConfig()
 	cfg.WorkerKills = minimumWorkerKills - 1
 	if err := cfg.validate(); err == nil {
-		t.Fatal("configuration with fewer than 20 worker kills passed validation")
+		t.Fatal("configuration below the worker-kill minimum passed validation")
+	}
+}
+
+func TestReducedPortfolioDefaults(t *testing.T) {
+	if defaultRuns != 1 || defaultJobs != 5_000 || defaultWorkerKills != 20 {
+		t.Fatalf(
+			"defaults = runs %d, jobs %d, worker kills %d",
+			defaultRuns,
+			defaultJobs,
+			defaultWorkerKills,
+		)
 	}
 }
 

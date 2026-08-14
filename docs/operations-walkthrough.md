@@ -9,10 +9,14 @@ This walkthrough is a qualification drill for a fresh disposable stack. It:
 3. drives a one-attempt job into `DEAD_LETTER`;
 4. lists and redrives that dead letter through the control API;
 5. verifies durable actor and timestamp records for each operator action; and
-6. observes live fire and recovery for `RailYardReadyStartSLOBreach` and
-   `RailYardDLQDepthHigh`; and
-7. pairs the lifecycle report with retained promtool fire-and-recovery
-   evidence for both rules.
+6. pairs the live lifecycle report with retained deterministic promtool
+   fire-and-recovery evidence for `RailYardReadyStartSLOBreach` and
+   `RailYardDLQDepthHigh`.
+
+This is the reduced portfolio P5 qualifier. Long live alert waits are not a
+qualification requirement. Live alert timestamps may be retained as
+supplemental observations, but the final audit scores the lifecycle and
+deterministic rule evidence.
 
 The recovery drill intentionally leaves the killed worker unavailable for nine
 seconds. It is supposed to breach the five-second recovery target. Do not use
@@ -153,31 +157,20 @@ promtool check rules deploy/prometheus/alerts.yml
 promtool test rules deploy/prometheus/slo-tests.yml
 ```
 
-Prometheus must load these alert names:
+The checked rules and tests must cover these alert names:
 
 - `RailYardReadyStartSLOBreach`;
 - `RailYardDLQDepthHigh`.
 
-The walkthrough command runs both promtool checks before the live drill and
-retains `promtool-check.log`, `promtool-test.log`, `slo-summary.json`,
-`walkthrough.json`, and `SHA256SUMS` in the report directory.
+The evidence directory retains `promtool-check.log`, `promtool-test.log`,
+`slo-summary.json`, `walkthrough.json`, and `SHA256SUMS`. The final audit
+requires both logs, exact deterministic fire-and-recovery counts, a passing
+three-node DAG and reassignment/DLQ/redrive lifecycle, and the linked audit
+evidence. It does not require nonzero live alert timestamps.
 
-The live drill stops the workers, creates 10 current unredriven dead letters,
-and submits 20 jobs that remain ready for more than five seconds. It then
-starts the workers and observes the ready-start alert after its five-minute
-`for` duration. Recovery uses 2,400 bounded no-op observations in batches of
-100, which raises the controlled population above the 99 percent threshold
-without waiting for the 30-minute window to expire.
-
-The 10 dead letters remain unredriven through the alert's ten-minute `for`
-duration. After Prometheus reports the alert firing, the harness redrives all
-10 entries, verifies the current depth is zero, and observes the alert become
-inactive.
-
-The walkthrough report retains actual observation times only. For compatibility
-with the release audit schema, `recovery_alert_*` contains the ready-start SLO
-times and `queue_alert_*` contains the DLQ depth times. A normal run takes about
-12 to 18 minutes. The acceptance command uses a 35-minute bound.
+The current walkthrough can also exercise the live alerts and retain actual
+observation times. Those observations are supplemental and do not replace the
+deterministic promtool evidence.
 
 ## Start the disposable stack
 
@@ -223,7 +216,7 @@ go run ./test/p5/cmd/walkthrough \
   -actor p5-walkthrough \
   -slo-rule-evidence slo-summary.json \
   -output "results/_work/p5/$RUN_ID/walkthrough.json" \
-  -timeout 35m
+  -timeout 25m
 ```
 
 The DLQ redrive uses
@@ -242,7 +235,7 @@ go test ./test/p5 \
   -run '^TestOperationsWalkthrough$' \
   -count=1 \
   -v \
-  -timeout 40m
+  -timeout 30m
 ```
 
 Do not run the harness and acceptance test concurrently. Both control the same
@@ -261,9 +254,9 @@ npx --yes playwright@1.61.0 install chromium
 mkdir -p "results/_work/p5/$RUN_ID/screenshots"
 ```
 
-Start each alert capture function in a separate terminal before starting the
-harness. It waits for a real firing state, captures it, waits for recovery, and
-then captures the inactive rule page.
+The alert screenshots below are optional supplemental evidence and are outside
+the reduced portfolio qualification. Start each capture function in a separate
+terminal before a full live-alert drill.
 
 ```sh
 capture_alert() {

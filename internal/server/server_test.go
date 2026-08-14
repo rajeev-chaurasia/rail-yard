@@ -42,17 +42,23 @@ func TestControlRoutes(t *testing.T) {
 	job := domain.Job{ID: "job-1", State: domain.StatePending}
 	jobStore := &fakeStore{
 		submitJob: func(
-			context.Context,
-			store.Submission,
-			time.Time,
+			_ context.Context,
+			submission store.Submission,
+			_ time.Time,
 		) (domain.Job, bool, error) {
+			if submission.Actor != "test-actor" {
+				t.Fatalf("job actor = %q", submission.Actor)
+			}
 			return job, false, nil
 		},
 		submitWorkflow: func(
-			context.Context,
-			store.WorkflowSubmission,
-			time.Time,
+			_ context.Context,
+			submission store.WorkflowSubmission,
+			_ time.Time,
 		) ([]domain.Job, bool, error) {
+			if submission.Actor != "test-actor" {
+				t.Fatalf("workflow actor = %q", submission.Actor)
+			}
 			return []domain.Job{job}, false, nil
 		},
 		getJob: func(_ context.Context, jobID string) (domain.Job, error) {
@@ -636,6 +642,10 @@ func TestSubmissionRequiresIdempotencyAndUsesStableDigest(t *testing.T) {
 			_ time.Time,
 		) (domain.Job, bool, error) {
 			submissions = append(submissions, submission)
+			if len(submissions) > 1 &&
+				submission.RequestDigest != submissions[0].RequestDigest {
+				return domain.Job{}, false, domain.ErrIdempotencyConflict
+			}
 			return domain.Job{ID: "job-1"}, len(submissions) > 1, nil
 		},
 	}
@@ -689,6 +699,9 @@ func TestSubmissionRequiresIdempotencyAndUsesStableDigest(t *testing.T) {
 	if submissions[0].IdempotencyKey != "stable-key" {
 		t.Fatalf("idempotency key = %q", submissions[0].IdempotencyKey)
 	}
+	if submissions[0].Actor != "test-actor" {
+		t.Fatalf("actor = %q", submissions[0].Actor)
+	}
 	if submissions[0].RequestDigest != submissions[1].RequestDigest {
 		t.Fatalf(
 			"semantically identical requests have different digests: %s != %s",
@@ -698,6 +711,148 @@ func TestSubmissionRequiresIdempotencyAndUsesStableDigest(t *testing.T) {
 	}
 	if len(submissions[0].RequestDigest) != 64 {
 		t.Fatalf("digest length = %d", len(submissions[0].RequestDigest))
+	}
+
+	differentActor := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/jobs",
+		strings.NewReader(`{"job":{"payload":{"type":"noop"}}}`),
+	)
+	differentActor.Header.Set("Idempotency-Key", "stable-key")
+	differentActor.Header.Set(actorHeaderName, "other-actor")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, differentActor)
+	assertErrorResponse(t, response, http.StatusConflict, "idempotency_conflict")
+}
+
+func TestLegacyMutationsRequireValidActor(t *testing.T) {
+	var calls atomic.Int32
+	jobStore := &fakeStore{
+		submitJob: func(
+			context.Context,
+			store.Submission,
+			time.Time,
+		) (domain.Job, bool, error) {
+			calls.Add(1)
+			return domain.Job{}, false, nil
+		},
+		submitWorkflow: func(
+			context.Context,
+			store.WorkflowSubmission,
+			time.Time,
+		) ([]domain.Job, bool, error) {
+			calls.Add(1)
+			return nil, false, nil
+		},
+		redriveDeadLetter: func(
+			context.Context,
+			string,
+			string,
+			string,
+			time.Time,
+		) (domain.Job, bool, error) {
+			calls.Add(1)
+			return domain.Job{}, false, nil
+		},
+	}
+	triggerStore := &triggerStoreStub{
+		create: func(
+			context.Context,
+			store.CronSubmission,
+			time.Time,
+		) (domain.CronTrigger, bool, error) {
+			calls.Add(1)
+			return domain.CronTrigger{}, false, nil
+		},
+	}
+	server := newTestServer(t, jobStore, func(config *Config) {
+		config.TriggerStore = triggerStore
+		config.CronInterval = time.Hour
+	})
+
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "job",
+			path: "/v1/jobs",
+			body: `{"job":{"payload":{"type":"noop"}}}`,
+		},
+		{
+			name: "workflow",
+			path: "/v1/workflows",
+			body: `{"nodes":[{"key":"a","job":{"payload":{"type":"noop"}}}]}`,
+		},
+		{
+			name: "redrive",
+			path: "/v1/dead-letters/job-1/redrive",
+		},
+		{
+			name: "cron",
+			path: "/v1/triggers/cron",
+			body: `{"expression":"* * * * *","job":{"payload":{"type":"noop"}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name+" missing", func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				test.path,
+				strings.NewReader(test.body),
+			)
+			request.Header.Set("Idempotency-Key", "key")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+		})
+		t.Run(test.name+" invalid", func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				test.path,
+				strings.NewReader(test.body),
+			)
+			request.Header.Set("Idempotency-Key", "key")
+			request.Header.Set(actorHeaderName, "invalid actor")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("store calls = %d, want zero", calls.Load())
+	}
+}
+
+func TestLegacyRedrivePropagatesActor(t *testing.T) {
+	jobStore := &fakeStore{
+		redriveDeadLetter: func(
+			ctx context.Context,
+			jobID string,
+			key string,
+			digest string,
+			_ time.Time,
+		) (domain.Job, bool, error) {
+			if actor := store.ActorFromContext(ctx); actor != "test-actor" {
+				t.Fatalf("redrive actor = %q", actor)
+			}
+			if jobID != "job-1" || key != "redrive-key" || len(digest) != 64 {
+				t.Fatalf("redrive command = job %q, key %q, digest %q", jobID, key, digest)
+			}
+			return domain.Job{ID: "job-2"}, false, nil
+		},
+	}
+	server := newTestServer(t, jobStore, nil)
+	response := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/dead-letters/job-1/redrive",
+		"",
+		"redrive-key",
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
 	}
 }
 
@@ -1072,6 +1227,7 @@ func performRequest(
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
+		request.Header.Set(actorHeaderName, "test-actor")
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

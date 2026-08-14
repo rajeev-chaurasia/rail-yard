@@ -5,6 +5,11 @@ is valid only after the benchmark runner drains the workload, an operator stops
 all database writers, and the reconciliation command validates a consistent
 SQLite snapshot.
 
+The final portfolio qualification is deliberately reduced to fit about one
+hour on the documented host. It covers 5,000 jobs per benchmark workload and
+one 5,000-job chaos run. It must not be described as a 50,000-job benchmark or
+a ten-run, 50,000-job chaos campaign.
+
 ## Published evidence status
 
 No committed throughput or chaos directory currently satisfies the
@@ -12,12 +17,11 @@ qualification contract. Content under `results/_work/` is scratch output and
 must not be cited as a published result.
 
 The committed SLO summary at `results/slo/20260814T104500Z/summary.json`
-records deterministic promtool rule tests only. It does not prove a live alert
-fired or recovered. The committed P5 walkthrough at
+records deterministic promtool rule tests. It is not a complete P5 evidence
+directory by itself. The committed P5 walkthrough at
 `results/p5/20260814T124900Z/walkthrough.json` skipped live alert waits and
-lacks the current alert timestamps, retained promtool logs, and checksums. It
-is useful historical lifecycle output, but it is not current P5 qualification
-evidence.
+lacks co-located retained promtool logs and checksums. It is useful historical
+lifecycle output, but it is not reduced portfolio qualification evidence.
 
 ## Replay qualification
 
@@ -59,8 +63,8 @@ go run ./test/chaos \
   --resume \
   --compose-file deploy/compose.yaml \
   --project-prefix railyard-qualification-chaos \
-  --runs 10 \
-  --jobs 50000 \
+  --runs 1 \
+  --jobs 5000 \
   --worker-kills 20 \
   --job-duration 250ms \
   --action-min 100ms \
@@ -80,13 +84,12 @@ contains `manifest.json`, `submitted.jsonl`, `events.jsonl`,
 Compose logs, and `SHA256SUMS`. The campaign summary alone is not sufficient
 release evidence.
 
-The current release-audit reader in `hack/results` still expects chaos manifest
-version 2 and the older recovery sample shape and timing definition. The chaos
-harness and resume verifier emit and validate manifest version 3, including
-host-to-server clock mapping, and define `recovery_ms` from confirmed mapped
-kill time to durable successor lease time. Until the release-audit reader is
-updated, new chaos output cannot produce a final activation summary even when
-the campaign itself passes.
+The release-audit reader requires manifest version 3, including host-to-server
+clock mapping, and derives `recovery_ms` from confirmed mapped kill time to the
+durable successor lease time. It requires exactly one run, 5,000 jobs, 20
+worker kills, one server kill, zero lost or duplicate canonical terminal
+outcomes, and a nonempty recovery sample set. The output reports both p99 and
+sample count.
 
 ## Command contract
 
@@ -98,7 +101,7 @@ go run ./test/benchmark \
   --compose-file deploy/compose.yaml \
   --project-prefix railyard-benchmark \
   --runs 3 \
-  --jobs 50000 \
+  --jobs 5000 \
   --workers 8 \
   --worker-slots 256 \
   --output results/_work/benchmark-qualification-<run-id>
@@ -113,7 +116,7 @@ go run ./test/benchmark \
   --compose-file deploy/compose.yaml \
   --project-prefix railyard-benchmark \
   --runs 3 \
-  --jobs 50000 \
+  --jobs 5000 \
   --workers 8 \
   --worker-slots 256 \
   --output results/_work/benchmark-qualification-<run-id>
@@ -154,9 +157,9 @@ unique run ID and artifact directory.
   -output results/throughput/<warmup-directory> \
   -run-id <warmup-run-id> \
   -phase warmup \
-  -jobs 50000 \
+  -jobs 5000 \
   -workers 8 \
-  -worker-slots <frozen-slots-per-worker> \
+  -worker-slots 256 \
   -submit-concurrency <bounded-client-concurrency> \
   -environment <environment.json> \
   -configuration-sha256 <frozen-configuration-sha256> \
@@ -289,20 +292,21 @@ go run ./test/p5/cmd/walkthrough \
   --actor qualification \
   --slo-rule-evidence slo-summary.json \
   --output results/_work/p5/<run-id>/walkthrough.json \
-  --timeout 35m
+  --timeout 25m
 ```
 
 A passing directory contains `walkthrough.json`, `slo-summary.json`,
 `promtool-check.log`, `promtool-test.log`, and `SHA256SUMS`. The walkthrough
-report must have nonzero fire and recovery timestamps for
-`RailYardReadyStartSLOBreach` and `RailYardDLQDepthHigh`,
-`live_alert_waits_skipped` must be false, and `passed` must be true. P5 has no
-resume mode and requires a fresh disposable Compose project.
+report must prove the live three-node DAG, worker reassignment,
+dead-letter/redrive, and actor audit lifecycle, and `passed` must be true. The
+SLO summary must report exactly two alerts and two deterministic
+fire-and-recovery cases. Live alert timestamps are supplemental and are not a
+reduced portfolio qualifier. P5 has no resume mode and requires a fresh
+disposable Compose project.
 
 ## Final release audit
 
-After the chaos reader incompatibility above is fixed, generate the immutable
-activation decision from the five checked summaries:
+Generate the immutable activation decision from the five checked summaries:
 
 ```sh
 go run ./hack/results \
@@ -315,4 +319,6 @@ go run ./hack/results \
 ```
 
 The output path must be new. The command verifies each input directory's
-checksums and exits nonzero for invalid evidence or a measured miss.
+checksums and exits nonzero for invalid evidence or a measured miss. It rejects
+old 50,000-job benchmark evidence, old ten-run chaos evidence, mixed workload
+shapes, nonexact replay counts, and incomplete P5 rule evidence.

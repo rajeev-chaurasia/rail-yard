@@ -140,8 +140,8 @@ Gate: deterministic property, race, and Docker integration suites pass.
 Add targeted crash failpoints, a seeded chaos controller, independent ledger
 reconciliation, and deterministic replay.
 
-Gate: ten 50,000-job chaos runs reconcile with no lost or duplicate canonical
-terminal outcomes, and three full replays match byte-for-byte.
+Gate: the reduced portfolio chaos run reconciles with no lost or duplicate
+canonical terminal outcomes, and three full replays match byte-for-byte.
 
 ### P4: measured operations
 
@@ -170,28 +170,36 @@ the dashboard CSRF cookie and header. The older `/v1` mutation routes are not
 actor-attributed, so they are not the operator audit surface.
 
 Gate: complete a recorded DAG lifecycle through the API and dashboard, then
-prove both SLO alerts fire and recover under deliberate breaches.
+prove both SLO alerts fire and recover in deterministic promtool rule tests.
 
-## Qualification targets
+## Reduced portfolio qualification
+
+This portfolio qualification is deliberately bounded to fit about one hour on
+the documented host. It does not claim a 50,000-job benchmark or a ten-run,
+50,000-job chaos campaign.
 
 These are acceptance targets, not achieved results:
 
-1. **Throughput:** three-run median of at least 10,000 durable no-op scheduling
-   decisions per minute on one host with eight worker processes at 256 slots
-   each. Every run must also reconcile all accepted jobs to successful terminal
+1. **Throughput:** one unscored warm-up plus three measured runs of exactly
+   5,000 no-op jobs. The target is a three-run median of at least 10,000 durable
+   lease grants per minute on one host with eight worker processes at 256 slots
+   each. Every run must reconcile all accepted jobs to successful terminal
    outcomes.
-2. **Chaos correctness:** ten seeded runs of 50,000 accepted jobs, with random
-   worker kills and one server kill per run, produce zero lost and zero
-   duplicate canonical terminal outcomes.
+2. **Chaos correctness:** one recorded-seed run of exactly 5,000 accepted
+   no-op jobs, exactly 20 worker `SIGKILL` actions, and exactly one server
+   `SIGKILL` produces zero lost and zero duplicate canonical terminal outcomes.
 3. **Recovery:** dead-worker jobs receive a durable successor lease within five
-   seconds at p99 across the chaos campaign, using one-second heartbeats.
-4. **Determinism:** three fresh-process replays reproduce 100% of canonical
-   scheduling decisions byte-identically.
+   seconds at p99 across the chaos run, using one-second heartbeats. The report
+   includes the p99 and the checked sample count.
+4. **Determinism:** three separate operating system processes replay exactly
+   50,000 decisions and reproduce 100% of canonical scheduling decisions
+   byte-identically.
 5. **Operations lifecycle:** submit a DAG, observe execution, kill a worker,
    observe reassignment, force a failure into the dead-letter queue, and
    redrive it through the API and dashboard with a complete actor audit trail.
 6. **SLO validation:** both committed SLO alerts fire and recover in
-   deterministic rule tests and an integration walkthrough.
+   deterministic promtool rule tests. Long live alert waits are not part of the
+   reduced portfolio qualifier.
 
 Candidate qualification output is written under `results/_work/`. Only a
 reviewed, complete evidence set with the required manifests, raw samples,
@@ -221,12 +229,13 @@ The system is designed to run locally without cloud spend.
 
 ## Resume activation
 
-Once qualification evidence is committed, send:
+Once reduced portfolio qualification evidence is committed, send:
 
 ```text
 built: railyard
 ```
 
-with the four measured values: no-op scheduling rate, chaos reconciliation
-result, worker reassignment p99, and replay match percentage. Until then, this
+with the measured no-op scheduling rate, chaos reconciliation result, worker
+reassignment p99 and sample count, and replay match percentage. Claims must
+state the 5,000-job benchmark and single 5,000-job chaos scope. Until then, this
 repository describes work in progress rather than verified resume evidence.

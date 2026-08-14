@@ -14,6 +14,11 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/trigger"
 )
 
+type storedCronJob struct {
+	domain.JobSpec
+	Actor string `json:"actor,omitempty"`
+}
+
 func (s *Store) CreateCronTrigger(
 	ctx context.Context,
 	submission storepkg.CronSubmission,
@@ -77,7 +82,10 @@ func (s *Store) CreateCronTrigger(
 	value.CreatedAt = now.UTC()
 	value.UpdatedAt = now.UTC()
 	value.NextFireAt = schedule.Next(now.UTC())
-	jobJSON, err := json.Marshal(value.Job)
+	jobJSON, err := json.Marshal(storedCronJob{
+		JobSpec: value.Job,
+		Actor:   submission.Actor,
+	})
 	if err != nil {
 		return domain.CronTrigger{}, false, fmt.Errorf("encode cron job: %w", err)
 	}
@@ -141,6 +149,7 @@ func (s *Store) FireDueCron(ctx context.Context, now time.Time, limit int) ([]st
 		tenantID   string
 		expression string
 		job        domain.JobSpec
+		actor      string
 		nominal    time.Time
 	}
 	values := make([]dueTrigger, 0, limit)
@@ -152,9 +161,15 @@ func (s *Store) FireDueCron(ctx context.Context, now time.Time, limit int) ([]st
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan due cron trigger: %w", err)
 		}
-		if err := json.Unmarshal([]byte(jobJSON), &value.job); err != nil {
+		var storedJob storedCronJob
+		if err := json.Unmarshal([]byte(jobJSON), &storedJob); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("decode cron job: %w", err)
+		}
+		value.job = storedJob.JobSpec
+		value.actor = storedJob.Actor
+		if value.actor == "" {
+			value.actor = "system"
 		}
 		value.nominal = timeFromDB(nominal)
 		values = append(values, value)
@@ -172,6 +187,7 @@ func (s *Store) FireDueCron(ctx context.Context, now time.Time, limit int) ([]st
 		sum := sha256.Sum256([]byte(key))
 		job, _, err := s.SubmitJob(ctx, storepkg.Submission{
 			Job:            value.job,
+			Actor:          value.actor,
 			IdempotencyKey: key,
 			RequestDigest:  hex.EncodeToString(sum[:]),
 		}, now)
@@ -248,6 +264,7 @@ func (s *Store) DeliverRedis(ctx context.Context, delivery trigger.RedisDelivery
 	now := time.Now().UTC()
 	job, _, err := s.SubmitJob(ctx, storepkg.Submission{
 		Job:            spec,
+		Actor:          "system",
 		IdempotencyKey: delivery.IdempotencyKey(),
 		RequestDigest:  hex.EncodeToString(sum[:]),
 	}, now)

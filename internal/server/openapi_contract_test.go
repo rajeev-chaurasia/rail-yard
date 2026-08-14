@@ -53,9 +53,13 @@ func TestOpenAPICoversMountedRoutes(t *testing.T) {
 	}
 }
 
-func TestOpenAPIOperationsMutationsRequireActors(t *testing.T) {
+func TestOpenAPIMutationsRequireActors(t *testing.T) {
 	body := readOpenAPI(t)
 	for _, path := range []string{
+		"/v1/jobs",
+		"/v1/workflows",
+		"/v1/dead-letters/{job_id}/redrive",
+		"/v1/triggers/cron",
 		"/v1/operations/jobs",
 		"/v1/operations/dags",
 		"/v1/operations/jobs/{job_id}/cancel",

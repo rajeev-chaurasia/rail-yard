@@ -82,7 +82,7 @@ independent reconciliation tool, and deterministic replay.
 
 ## Qualification oracle
 
-For a 50,000-job no-op chaos run, define:
+For the reduced portfolio 5,000-job no-op chaos run, define:
 
 - `A`: durably accepted job IDs from the submitted manifest and idempotency
   receipts;
@@ -92,12 +92,12 @@ For a 50,000-job no-op chaos run, define:
 The run passes only when:
 
 ```text
-|A| = 50,000
-|T| = 50,000
+|A| = 5,000
+|T| = 5,000
 lost = |A - T| = 0
 orphan = |T - A| = 0
 duplicates = sum(max(0, C(j) - 1)) = 0
-SUCCEEDED = 50,000
+SUCCEEDED = 5,000
 FAILED = DEAD_LETTER = active = 0
 ```
 

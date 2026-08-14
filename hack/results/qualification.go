@@ -23,12 +23,14 @@ import (
 
 const (
 	schemaVersion            = 1
+	chaosManifestVersion     = 3
 	requiredBenchmarkRuns    = 3
-	requiredJobsPerRun       = 50_000
+	requiredJobsPerRun       = 5_000
 	requiredWorkers          = 8
 	requiredWorkerSlots      = 256
-	requiredChaosRuns        = 10
+	requiredChaosRuns        = 1
 	requiredWorkerKills      = 20
+	maxClockUncertainty      = 250 * time.Millisecond
 	requiredReplayDecisions  = 50_000
 	requiredReplays          = 3
 	throughputTarget         = 10_000.0
@@ -37,6 +39,21 @@ const (
 	requiredSLOAlerts        = 2
 	requiredSLORecoveryCases = 2
 )
+
+var requiredReconciliationChecks = []string{
+	"sqlite_integrity",
+	"sqlite_settings",
+	"foreign_keys",
+	"manifest",
+	"canonical_ledger",
+	"materialized_jobs",
+	"idempotency",
+	"attempts_and_leases",
+	"event_log",
+	"dag",
+	"slot_accounting",
+	"schema_migrations",
+}
 
 type inputPaths struct {
 	benchmark string
@@ -83,11 +100,11 @@ type replayResult struct {
 }
 
 type operationsResult struct {
-	EvidenceValid       bool `json:"evidence_valid"`
-	Qualified           bool `json:"qualified"`
-	WorkflowJobs        int  `json:"workflow_jobs"`
-	AuditEvents         int  `json:"audit_events"`
-	LiveAlertsValidated bool `json:"live_alerts_validated"`
+	EvidenceValid               bool `json:"evidence_valid"`
+	Qualified                   bool `json:"qualified"`
+	WorkflowJobs                int  `json:"workflow_jobs"`
+	AuditEvents                 int  `json:"audit_events"`
+	DeterministicRulesValidated bool `json:"deterministic_rules_validated"`
 }
 
 type sloResult struct {
@@ -95,7 +112,7 @@ type sloResult struct {
 	Qualified            bool `json:"qualified"`
 	Alerts               int  `json:"alerts"`
 	FireAndRecoveryCases int  `json:"fire_and_recovery_cases"`
-	IntegrationValidated bool `json:"integration_validated"`
+	P5EvidenceLinked     bool `json:"p5_evidence_linked"`
 }
 
 type qualificationSummary struct {
@@ -164,28 +181,69 @@ type chaosManifest struct {
 }
 
 type recoverySample struct {
-	KillSequence        int       `json:"kill_sequence"`
-	Worker              string    `json:"worker"`
-	VictimContainerID   string    `json:"victim_container_id"`
-	JobID               string    `json:"job_id"`
-	KilledAttempt       int       `json:"killed_attempt"`
-	KilledGeneration    int64     `json:"killed_generation"`
-	KillConfirmedAt     time.Time `json:"kill_confirmed_at"`
-	SuccessorAttempt    int       `json:"successor_attempt"`
-	SuccessorGeneration int64     `json:"successor_generation"`
-	SuccessorLeasedAt   time.Time `json:"successor_leased_at"`
-	SuccessorObservedAt time.Time `json:"successor_observed_at"`
-	CompletionAt        time.Time `json:"completion_at"`
-	RecoveryMS          float64   `json:"recovery_ms"`
+	KillSequence        int          `json:"kill_sequence"`
+	Worker              string       `json:"worker"`
+	VictimContainerID   string       `json:"victim_container_id"`
+	JobID               string       `json:"job_id"`
+	KilledAttempt       int          `json:"killed_attempt"`
+	KilledGeneration    int64        `json:"killed_generation"`
+	KillConfirmedHostAt time.Time    `json:"kill_confirmed_host_at"`
+	KillConfirmedAt     time.Time    `json:"kill_confirmed_at"`
+	ClockMapping        clockMapping `json:"clock_mapping"`
+	SuccessorAttempt    int          `json:"successor_attempt"`
+	SuccessorGeneration int64        `json:"successor_generation"`
+	SuccessorLeasedAt   time.Time    `json:"successor_leased_at"`
+	SuccessorObservedAt time.Time    `json:"successor_observed_at"`
+	CompletionAt        time.Time    `json:"completion_at"`
+	RecoveryMS          float64      `json:"recovery_ms"`
+}
+
+type clockMapping struct {
+	HostLowerBound time.Time     `json:"host_lower_bound"`
+	HostUpperBound time.Time     `json:"host_upper_bound"`
+	ServerTime     time.Time     `json:"server_time"`
+	Offset         time.Duration `json:"offset"`
+	Uncertainty    time.Duration `json:"uncertainty"`
+}
+
+type activeLease struct {
+	JobID      string    `json:"JobID"`
+	AttemptNo  int       `json:"AttemptNo"`
+	Generation int64     `json:"Generation"`
+	LeasedAt   time.Time `json:"LeasedAt"`
 }
 
 type chaosEvent struct {
-	Sequence   int            `json:"sequence"`
-	Type       string         `json:"type"`
-	PlannedAt  time.Time      `json:"planned_at,omitempty"`
-	ObservedAt time.Time      `json:"observed_at"`
-	Service    string         `json:"service,omitempty"`
-	Details    map[string]any `json:"details,omitempty"`
+	Sequence   int             `json:"sequence"`
+	Type       string          `json:"type"`
+	PlannedAt  time.Time       `json:"planned_at,omitempty"`
+	ObservedAt time.Time       `json:"observed_at"`
+	Service    string          `json:"service,omitempty"`
+	Details    json.RawMessage `json:"details,omitempty"`
+}
+
+type workerKillDetails struct {
+	KillSequence    int           `json:"kill_sequence"`
+	VictimContainer string        `json:"victim_container_id"`
+	KillConfirmedAt time.Time     `json:"kill_confirmed_at"`
+	ClockMapping    clockMapping  `json:"clock_mapping"`
+	PreKillLeases   []activeLease `json:"pre_kill_leases"`
+	AffectedLeases  []activeLease `json:"active_leases"`
+}
+
+type expectedRecoverySample struct {
+	Worker              string
+	VictimContainerID   string
+	Lease               activeLease
+	KillConfirmedHostAt time.Time
+	KillConfirmedAt     time.Time
+	ClockMapping        clockMapping
+}
+
+type chaosRunEvidence struct {
+	RecoveryDurations  []time.Duration
+	ConfigurationHash  string
+	ReconciliationPass bool
 }
 
 type replaySummary struct {
@@ -270,8 +328,8 @@ func evaluate(paths inputPaths) qualificationSummary {
 	operations, digest, reasons := validateP5(paths.p5, paths.slo, slo.Qualified)
 	summary.Operations = operations
 	summary.Inputs.P5Walkthrough = digest
-	summary.SLO.IntegrationValidated = operations.LiveAlertsValidated
-	summary.SLO.Qualified = summary.SLO.Qualified && operations.LiveAlertsValidated
+	summary.SLO.P5EvidenceLinked = operations.DeterministicRulesValidated
+	summary.SLO.Qualified = summary.SLO.Qualified && operations.DeterministicRulesValidated
 	appendReasons(&summary, "p5", reasons)
 
 	slices.Sort(summary.InvalidReasons)
@@ -316,7 +374,7 @@ func evaluate(paths inputPaths) qualificationSummary {
 	if !summary.SLO.Qualified {
 		summary.MeasuredMisses = append(
 			summary.MeasuredMisses,
-			"SLO alerts did not fire and recover in both rule tests and the integration walkthrough",
+			"deterministic SLO fire-and-recovery evidence did not pass or was not linked to P5",
 		)
 	}
 	slices.Sort(summary.MeasuredMisses)
@@ -465,7 +523,14 @@ func validateChaos(path string) (chaosResult, string, []string) {
 		RequiredRuns:            requiredChaosRuns,
 		RecoveryTargetExclusive: int64(recoveryTarget),
 	}
-	digest, err := verifyInput(path)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return result, "", []string{fmt.Sprintf("inspect %s: %v", path, err)}
+	}
+	if !info.Mode().IsRegular() {
+		return result, "", []string{fmt.Sprintf("%s is not a regular file", path)}
+	}
+	digest, err := fileSHA256(path)
 	if err != nil {
 		return result, "", []string{err.Error()}
 	}
@@ -493,8 +558,8 @@ func validateChaos(path string) (chaosResult, string, []string) {
 
 	seenRuns := make(map[int]struct{}, len(campaign.Runs))
 	seenSeeds := make(map[int64]struct{}, len(campaign.Runs))
-	var observedRecovery []float64
-	var committedRecovery []time.Duration
+	var recoveryDurations []time.Duration
+	configurationHash := ""
 	reconciled := 0
 	for _, run := range campaign.Runs {
 		if run.Run < 1 || run.Run > requiredChaosRuns {
@@ -508,46 +573,68 @@ func validateChaos(path string) (chaosResult, string, []string) {
 			reasons = append(reasons, fmt.Sprintf("seed %d is duplicated", run.Seed))
 		}
 		seenSeeds[run.Seed] = struct{}{}
+		if run.StartedAt.Before(campaign.StartedAt) ||
+			run.CompletedAt.After(campaign.CompletedAt) {
+			reasons = append(reasons, fmt.Sprintf(
+				"run %d timestamps are outside the campaign",
+				run.Run,
+			))
+		}
 		directory, resolveErr := resolveEvidenceDirectory(run.ArtifactDirectory, filepath.Dir(path))
 		if resolveErr != nil {
 			reasons = append(reasons, fmt.Sprintf("run %d: %v", run.Run, resolveErr))
 			continue
 		}
-		runObserved, runCommitted, runReasons := validateChaosRun(directory, run)
-		observedRecovery = append(observedRecovery, runObserved...)
-		committedRecovery = append(committedRecovery, runCommitted...)
+		runEvidence, runReasons := validateChaosRun(directory, run)
+		recoveryDurations = append(recoveryDurations, runEvidence.RecoveryDurations...)
 		for _, reason := range runReasons {
 			reasons = append(reasons, fmt.Sprintf("run %d: %s", run.Run, reason))
 		}
-		if run.ReconciliationPass {
+		if runEvidence.ConfigurationHash != "" {
+			if configurationHash == "" {
+				configurationHash = runEvidence.ConfigurationHash
+			} else if configurationHash != runEvidence.ConfigurationHash {
+				reasons = append(reasons, fmt.Sprintf(
+					"run %d: configuration_hash does not match the campaign",
+					run.Run,
+				))
+			}
+		}
+		if runEvidence.ReconciliationPass {
 			reconciled++
 		}
 	}
-	if campaign.RecoverySamples != len(observedRecovery) {
+	if campaign.RecoverySamples != len(recoveryDurations) {
 		reasons = append(reasons, fmt.Sprintf(
 			"campaign recovery_samples=%d, checked samples=%d",
 			campaign.RecoverySamples,
-			len(observedRecovery),
+			len(recoveryDurations),
 		))
 	}
-	if len(observedRecovery) == 0 {
+	var derivedP99 time.Duration
+	if len(recoveryDurations) == 0 {
 		reasons = append(reasons, "campaign has no recovery samples")
-	} else if !equalFloat(campaign.RecoveryP99MS, nearestRankFloat(observedRecovery, 99)) {
-		reasons = append(reasons, "campaign recovery_p99_ms does not match checked samples")
+	} else {
+		derivedP99 = nearestRankDuration(recoveryDurations, 99)
+		if !equalFloat(campaign.RecoveryP99MS, durationMilliseconds(derivedP99)) {
+			reasons = append(
+				reasons,
+				"campaign recovery_p99_ms does not match durable checked samples",
+			)
+		}
 	}
 	expectedPassed := reconciled == requiredChaosRuns &&
 		len(campaign.Runs) == requiredChaosRuns &&
-		campaign.RecoveryP99MS < campaign.RecoveryTargetMS
+		len(recoveryDurations) > 0 &&
+		derivedP99 < recoveryTarget
 	if campaign.Passed != expectedPassed {
 		reasons = append(reasons, "campaign passed status does not match measured results")
 	}
 
 	result.Runs = len(campaign.Runs)
 	result.ReconciledRuns = reconciled
-	result.RecoverySamples = len(committedRecovery)
-	if len(committedRecovery) > 0 {
-		result.RecoveryP99NS = int64(nearestRankDuration(committedRecovery, 99))
-	}
+	result.RecoverySamples = len(recoveryDurations)
+	result.RecoveryP99NS = int64(derivedP99)
 	result.EvidenceValid = len(reasons) == 0
 	result.CorrectnessQualified = result.EvidenceValid &&
 		result.Runs == requiredChaosRuns &&
@@ -561,34 +648,65 @@ func validateChaos(path string) (chaosResult, string, []string) {
 func validateChaosRun(
 	directory string,
 	run runSummary,
-) ([]float64, []time.Duration, []string) {
+) (chaosRunEvidence, []string) {
+	var checked chaosRunEvidence
 	if err := evidence.VerifyChecksums(directory); err != nil {
-		return nil, nil, []string{"checksums: " + err.Error()}
+		return checked, []string{"checksums: " + err.Error()}
+	}
+	if err := requireChaosArtifacts(directory); err != nil {
+		return checked, []string{err.Error()}
 	}
 	var reasons []string
 	var manifest chaosManifest
 	if err := readStrictJSON(filepath.Join(directory, "manifest.json"), &manifest); err != nil {
-		return nil, nil, []string{err.Error()}
+		return checked, []string{err.Error()}
 	}
-	if manifest.Version != 2 ||
-		manifest.Run != run.Run ||
+	if manifest.Version != chaosManifestVersion {
+		reasons = append(reasons, fmt.Sprintf(
+			"manifest version=%d, want %d",
+			manifest.Version,
+			chaosManifestVersion,
+		))
+	}
+	if manifest.Run != run.Run ||
 		manifest.Seed != run.Seed ||
 		manifest.Project != run.Project ||
 		manifest.TenantID != run.TenantID {
 		reasons = append(reasons, "manifest identity does not match campaign summary")
 	}
+	if !validSHA256(manifest.ConfigurationHash) {
+		reasons = append(reasons, "manifest configuration_hash is not a lowercase SHA-256")
+	} else {
+		checked.ConfigurationHash = manifest.ConfigurationHash
+	}
 	if manifest.Jobs != requiredJobsPerRun ||
 		len(manifest.Workers) != requiredWorkers ||
-		manifest.WorkerKills < requiredWorkerKills ||
+		!uniqueNonempty(manifest.Workers) ||
+		manifest.WorkerKills != requiredWorkerKills ||
 		manifest.MaxRecovery != recoveryTarget {
 		reasons = append(reasons, "manifest does not use the exact chaos qualification workload")
 	}
-	if manifest.CompletedAt.IsZero() || manifest.CompletedAt.Before(manifest.StartedAt) ||
-		run.CompletedAt.IsZero() || run.CompletedAt.Before(run.StartedAt) {
+	if manifest.Queue != "noop" ||
+		manifest.SubmitConcurrency < 1 ||
+		manifest.JobDuration < 0 ||
+		!finiteInRange(manifest.ServerKillTarget, 0.20, 0.80) ||
+		manifest.ServerKillTargetJobs < 1 ||
+		manifest.ServerKillTargetJobs > requiredJobsPerRun ||
+		strings.TrimSpace(manifest.ComposeFile) == "" {
+		reasons = append(reasons, "manifest v3 configuration is incomplete")
+	}
+	if manifest.StartedAt.IsZero() ||
+		manifest.CompletedAt.IsZero() ||
+		manifest.CompletedAt.Before(manifest.StartedAt) ||
+		run.StartedAt.IsZero() ||
+		run.CompletedAt.IsZero() ||
+		run.CompletedAt.Before(run.StartedAt) ||
+		!manifest.StartedAt.Equal(run.StartedAt) ||
+		run.CompletedAt.Before(manifest.CompletedAt) {
 		reasons = append(reasons, "run timestamps are incomplete")
 	}
 	if run.Accepted != requiredJobsPerRun ||
-		run.WorkerKills < requiredWorkerKills ||
+		run.WorkerKills != requiredWorkerKills ||
 		run.ServerKills != 1 ||
 		run.RecoveryTargetMS != float64(recoveryTarget)/float64(time.Millisecond) {
 		reasons = append(reasons, "run counts or target do not match the exact chaos qualifier")
@@ -598,27 +716,24 @@ func validateChaosRun(
 	if err := readStrictJSON(filepath.Join(directory, "reconciliation.json"), &report); err != nil {
 		reasons = append(reasons, err.Error())
 	} else {
-		if report.Version != schemaVersion ||
-			report.ExpectedJobs != requiredJobsPerRun ||
-			report.Counts.Accepted != requiredJobsPerRun {
-			reasons = append(reasons, "reconciliation identity or accepted count is invalid")
-		}
+		reportValid, reportReasons := validateReconciliationReport(report)
+		reasons = append(reasons, reportReasons...)
 		if report.Passed != run.ReconciliationPass {
 			reasons = append(reasons, "reconciliation status does not match campaign summary")
 		}
-		if report.Passed &&
-			(report.ViolationCount != 0 ||
-				report.Counts.Jobs != requiredJobsPerRun ||
-				report.Counts.Completions != requiredJobsPerRun) {
-			reasons = append(reasons, "passing reconciliation report has incompatible counts")
+		if reportValid && report.Passed == run.ReconciliationPass {
+			checked.ReconciliationPass = report.Passed
 		}
 	}
 
-	workerKills, serverKills, eventErr := countChaosEvents(filepath.Join(directory, "events.jsonl"))
-	if eventErr != nil {
-		reasons = append(reasons, eventErr.Error())
-	} else if workerKills != run.WorkerKills || serverKills != run.ServerKills {
-		reasons = append(reasons, "action trace kill counts do not match campaign summary")
+	workerKills, serverKills, expectedSamples, eventReasons := readChaosEventEvidence(
+		filepath.Join(directory, "events.jsonl"),
+	)
+	reasons = append(reasons, eventReasons...)
+	if workerKills != run.WorkerKills ||
+		workerKills != manifest.WorkerKills ||
+		serverKills != run.ServerKills {
+		reasons = append(reasons, "action trace kill counts do not match run metadata")
 	}
 
 	samples, sampleErr := readStrictJSONLines[recoverySample](
@@ -626,31 +741,32 @@ func validateChaosRun(
 	)
 	if sampleErr != nil {
 		reasons = append(reasons, sampleErr.Error())
-		return nil, nil, reasons
+		return checked, reasons
 	}
-	var observed []float64
-	var committed []time.Duration
+	durations := make([]time.Duration, 0, len(samples))
+	observedSamples := make(map[string]struct{}, len(samples))
 	for index, sample := range samples {
-		if sample.JobID == "" ||
-			sample.Worker == "" ||
-			sample.VictimContainerID == "" ||
-			sample.KillConfirmedAt.IsZero() ||
-			sample.SuccessorLeasedAt.IsZero() ||
-			sample.SuccessorObservedAt.IsZero() ||
-			sample.SuccessorGeneration <= sample.KilledGeneration ||
-			sample.SuccessorAttempt <= sample.KilledAttempt {
-			reasons = append(reasons, fmt.Sprintf("recovery sample %d is incomplete", index+1))
+		key := recoverySampleKey(sample.KillSequence, sample.JobID)
+		expected, exists := expectedSamples[key]
+		if !exists {
+			reasons = append(reasons, fmt.Sprintf(
+				"recovery sample %d has no affected lease",
+				index+1,
+			))
 			continue
 		}
-		observedDuration := sample.SuccessorObservedAt.Sub(sample.KillConfirmedAt)
-		committedDuration := sample.SuccessorLeasedAt.Sub(sample.KillConfirmedAt)
-		if observedDuration < 0 || committedDuration < 0 ||
-			!equalFloat(sample.RecoveryMS, float64(observedDuration)/float64(time.Millisecond)) {
-			reasons = append(reasons, fmt.Sprintf("recovery sample %d has inconsistent timing", index+1))
+		if _, duplicate := observedSamples[key]; duplicate {
+			reasons = append(reasons, fmt.Sprintf("recovery sample %d is duplicated", index+1))
 			continue
 		}
-		observed = append(observed, sample.RecoveryMS)
-		committed = append(committed, committedDuration)
+		observedSamples[key] = struct{}{}
+		duration, sampleReasons := validateRecoverySample(sample, expected)
+		for _, reason := range sampleReasons {
+			reasons = append(reasons, fmt.Sprintf("recovery sample %d: %s", index+1, reason))
+		}
+		if len(sampleReasons) == 0 {
+			durations = append(durations, duration)
+		}
 	}
 	if run.RecoverySamples != len(samples) {
 		reasons = append(reasons, fmt.Sprintf(
@@ -659,12 +775,408 @@ func validateChaosRun(
 			len(samples),
 		))
 	}
-	if len(observed) == 0 {
-		reasons = append(reasons, "recovery samples are empty")
-	} else if !equalFloat(run.RecoveryP99MS, nearestRankFloat(observed, 99)) {
-		reasons = append(reasons, "recovery_p99_ms does not match checked samples")
+	if len(observedSamples) != len(expectedSamples) {
+		reasons = append(reasons, fmt.Sprintf(
+			"recovery samples=%d, affected leases=%d",
+			len(observedSamples),
+			len(expectedSamples),
+		))
 	}
-	return observed, committed, reasons
+	if len(durations) == 0 {
+		reasons = append(reasons, "recovery samples are empty")
+	} else if !equalFloat(
+		run.RecoveryP99MS,
+		durationMilliseconds(nearestRankDuration(durations, 99)),
+	) {
+		reasons = append(
+			reasons,
+			"recovery_p99_ms does not match durable checked samples",
+		)
+	}
+	checked.RecoveryDurations = durations
+	return checked, reasons
+}
+
+func requireChaosArtifacts(directory string) error {
+	required := []string{
+		"events.jsonl",
+		"logs/compose.log",
+		"manifest.json",
+		"reconciliation.json",
+		"recovery-samples.jsonl",
+		"submitted.jsonl",
+	}
+	for _, relative := range required {
+		info, err := os.Stat(filepath.Join(directory, filepath.FromSlash(relative)))
+		if err != nil {
+			return fmt.Errorf("required artifact %s: %w", relative, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("required artifact %s is not a regular file", relative)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(directory, "database"))
+	if err != nil {
+		return fmt.Errorf("required artifact database: %w", err)
+	}
+	databaseFiles := 0
+	for _, entry := range entries {
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return fmt.Errorf("inspect database artifact: %w", infoErr)
+		}
+		if info.Mode().IsRegular() {
+			databaseFiles++
+		}
+	}
+	if databaseFiles == 0 {
+		return errors.New("required database snapshot is missing")
+	}
+	return nil
+}
+
+func requireRegularArtifacts(directory string, names ...string) error {
+	for _, name := range names {
+		info, err := os.Stat(filepath.Join(directory, name))
+		if err != nil {
+			return fmt.Errorf("required artifact %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return fmt.Errorf("required artifact %s is not a nonempty regular file", name)
+		}
+	}
+	return nil
+}
+
+func validateReconciliationReport(report reconcile.Report) (bool, []string) {
+	var reasons []string
+	if report.Version != schemaVersion ||
+		report.GeneratedAt.IsZero() ||
+		report.ExpectedJobs != requiredJobsPerRun {
+		reasons = append(reasons, "reconciliation identity is invalid")
+	}
+	if report.ViolationCount < 0 ||
+		len(report.Violations) > report.ViolationCount ||
+		report.DetailsTruncated != (len(report.Violations) < report.ViolationCount) {
+		reasons = append(reasons, "reconciliation violation accounting is invalid")
+	}
+	seenChecks := make(map[string]struct{}, len(report.Checks))
+	checkViolations := 0
+	for _, check := range report.Checks {
+		if check.Name == "" || check.Violations < 0 ||
+			check.Passed != (check.Violations == 0) {
+			reasons = append(reasons, "reconciliation check accounting is invalid")
+			continue
+		}
+		if _, duplicate := seenChecks[check.Name]; duplicate {
+			reasons = append(reasons, "reconciliation check is duplicated: "+check.Name)
+			continue
+		}
+		seenChecks[check.Name] = struct{}{}
+		checkViolations += check.Violations
+	}
+	for _, name := range requiredReconciliationChecks {
+		if _, exists := seenChecks[name]; !exists {
+			reasons = append(reasons, "reconciliation check is missing: "+name)
+		}
+	}
+	if len(seenChecks) != len(requiredReconciliationChecks) {
+		reasons = append(reasons, "reconciliation contains unsupported checks")
+	}
+	if checkViolations != report.ViolationCount ||
+		report.Passed != (report.ViolationCount == 0) {
+		reasons = append(reasons, "reconciliation status does not match its checks")
+	}
+	if !validReconciliationCounts(report.Counts) {
+		reasons = append(reasons, "reconciliation counts are invalid")
+	}
+	if report.Passed &&
+		(report.Counts.Accepted != requiredJobsPerRun ||
+			report.Counts.Jobs != requiredJobsPerRun ||
+			report.Counts.Completions != requiredJobsPerRun ||
+			report.Counts.ActiveJobs != 0 ||
+			report.Counts.ActiveAttempts != 0 ||
+			report.Counts.SlotReservations != 0 ||
+			len(report.Counts.StateCounts) != 1 ||
+			report.Counts.StateCounts["SUCCEEDED"] != requiredJobsPerRun) {
+		reasons = append(
+			reasons,
+			"passing reconciliation report has loss, duplicates, or residual state",
+		)
+	}
+	return len(reasons) == 0, reasons
+}
+
+func validReconciliationCounts(counts reconcile.Counts) bool {
+	values := []int{
+		counts.Accepted,
+		counts.Jobs,
+		counts.Completions,
+		counts.Attempts,
+		counts.AttemptRepeats,
+		counts.Events,
+		counts.IdempotencyRows,
+		counts.ActiveJobs,
+		counts.ActiveAttempts,
+		counts.SlotReservations,
+	}
+	for _, value := range values {
+		if value < 0 {
+			return false
+		}
+	}
+	stateTotal := 0
+	for state, count := range counts.StateCounts {
+		if state == "" || count < 0 {
+			return false
+		}
+		stateTotal += count
+	}
+	return stateTotal == counts.Jobs
+}
+
+func readChaosEventEvidence(
+	path string,
+) (int, int, map[string]expectedRecoverySample, []string) {
+	events, err := readStrictJSONLines[chaosEvent](path)
+	if err != nil {
+		return 0, 0, nil, []string{err.Error()}
+	}
+	var reasons []string
+	workerKills := 0
+	serverKills := 0
+	expected := make(map[string]expectedRecoverySample)
+	killSequences := make(map[int]struct{})
+	for index, event := range events {
+		if event.Sequence != index+1 {
+			reasons = append(reasons, fmt.Sprintf(
+				"action event sequence=%d, want %d",
+				event.Sequence,
+				index+1,
+			))
+		}
+		switch event.Type {
+		case "worker_killed":
+			workerKills++
+			var details workerKillDetails
+			if err := decodeStrictJSON(event.Details, &details); err != nil {
+				reasons = append(reasons, fmt.Sprintf(
+					"worker kill event %d: %v",
+					event.Sequence,
+					err,
+				))
+				continue
+			}
+			if details.KillSequence < 1 {
+				reasons = append(reasons, "worker kill sequence is missing")
+			}
+			if _, duplicate := killSequences[details.KillSequence]; duplicate {
+				reasons = append(reasons, fmt.Sprintf(
+					"worker kill sequence %d is duplicated",
+					details.KillSequence,
+				))
+			}
+			killSequences[details.KillSequence] = struct{}{}
+			if event.Service == "" || details.VictimContainer == "" ||
+				event.ObservedAt.IsZero() || details.KillConfirmedAt.IsZero() {
+				reasons = append(reasons, fmt.Sprintf(
+					"worker kill event %d is incomplete",
+					event.Sequence,
+				))
+			}
+			if mappingErr := validateClockMapping(details.ClockMapping); mappingErr != nil {
+				reasons = append(reasons, fmt.Sprintf(
+					"worker kill event %d: %v",
+					event.Sequence,
+					mappingErr,
+				))
+			}
+			mappedKill := event.ObservedAt.Add(details.ClockMapping.Offset).UTC()
+			if !mappedKill.Equal(details.KillConfirmedAt) {
+				reasons = append(reasons, fmt.Sprintf(
+					"worker kill event %d has inconsistent calibrated kill time",
+					event.Sequence,
+				))
+			}
+			preKill := make(map[string]activeLease, len(details.PreKillLeases))
+			for _, lease := range details.PreKillLeases {
+				key := leaseFenceKey(lease)
+				if leaseErr := validateActiveLease(lease); leaseErr != nil {
+					reasons = append(reasons, fmt.Sprintf(
+						"worker kill event %d pre-kill lease: %v",
+						event.Sequence,
+						leaseErr,
+					))
+				}
+				if _, duplicate := preKill[key]; duplicate {
+					reasons = append(reasons, fmt.Sprintf(
+						"worker kill event %d has a duplicate pre-kill lease",
+						event.Sequence,
+					))
+				}
+				preKill[key] = lease
+			}
+			for _, lease := range details.AffectedLeases {
+				if leaseErr := validateActiveLease(lease); leaseErr != nil {
+					reasons = append(reasons, fmt.Sprintf(
+						"worker kill event %d affected lease: %v",
+						event.Sequence,
+						leaseErr,
+					))
+					continue
+				}
+				if _, exists := preKill[leaseFenceKey(lease)]; !exists {
+					reasons = append(reasons, fmt.Sprintf(
+						"worker kill event %d affected lease is absent from the pre-kill snapshot",
+						event.Sequence,
+					))
+				}
+				key := recoverySampleKey(details.KillSequence, lease.JobID)
+				if _, duplicate := expected[key]; duplicate {
+					reasons = append(reasons, "affected lease is duplicated: "+lease.JobID)
+					continue
+				}
+				expected[key] = expectedRecoverySample{
+					Worker:              event.Service,
+					VictimContainerID:   details.VictimContainer,
+					Lease:               lease,
+					KillConfirmedHostAt: event.ObservedAt,
+					KillConfirmedAt:     details.KillConfirmedAt,
+					ClockMapping:        details.ClockMapping,
+				}
+			}
+		case "server_killed":
+			serverKills++
+		}
+	}
+	if len(expected) == 0 {
+		reasons = append(reasons, "worker kills captured no affected leases")
+	}
+	for sequence := 1; sequence <= workerKills; sequence++ {
+		if _, exists := killSequences[sequence]; !exists {
+			reasons = append(reasons, fmt.Sprintf(
+				"worker kill sequence %d is missing",
+				sequence,
+			))
+		}
+	}
+	return workerKills, serverKills, expected, reasons
+}
+
+func validateRecoverySample(
+	sample recoverySample,
+	expected expectedRecoverySample,
+) (time.Duration, []string) {
+	var reasons []string
+	if sample.Worker != expected.Worker ||
+		sample.VictimContainerID != expected.VictimContainerID ||
+		sample.KilledAttempt != expected.Lease.AttemptNo ||
+		sample.KilledGeneration != expected.Lease.Generation {
+		reasons = append(reasons, "identity does not match the affected lease")
+	}
+	if sample.KillConfirmedHostAt.IsZero() ||
+		!sample.KillConfirmedHostAt.Equal(expected.KillConfirmedHostAt) ||
+		sample.KillConfirmedAt.IsZero() ||
+		!sample.KillConfirmedAt.Equal(expected.KillConfirmedAt) ||
+		!clockMappingsEqual(sample.ClockMapping, expected.ClockMapping) {
+		reasons = append(reasons, "calibrated kill evidence does not match the action trace")
+	}
+	if mappingErr := validateClockMapping(sample.ClockMapping); mappingErr != nil {
+		reasons = append(reasons, mappingErr.Error())
+	}
+	if sample.SuccessorAttempt <= sample.KilledAttempt ||
+		sample.SuccessorGeneration <= sample.KilledGeneration ||
+		sample.SuccessorLeasedAt.IsZero() ||
+		!sample.SuccessorLeasedAt.After(
+			sample.KillConfirmedAt.Add(sample.ClockMapping.Uncertainty),
+		) {
+		reasons = append(reasons, "durable successor lease is incomplete or outside the kill boundary")
+	}
+	if sample.SuccessorObservedAt.IsZero() ||
+		sample.SuccessorObservedAt.Add(
+			sample.ClockMapping.Uncertainty,
+		).Before(sample.SuccessorLeasedAt) {
+		reasons = append(reasons, "successor observation predates its durable lease")
+	}
+	if sample.CompletionAt.IsZero() || sample.CompletionAt.Before(sample.SuccessorLeasedAt) {
+		reasons = append(reasons, "durable successor completion is missing or unordered")
+	}
+	recovery := sample.SuccessorLeasedAt.Sub(sample.KillConfirmedAt)
+	if recovery < 0 ||
+		!finiteNonnegative(sample.RecoveryMS) ||
+		!equalFloat(sample.RecoveryMS, durationMilliseconds(recovery)) {
+		reasons = append(reasons, "recovery_ms is not derived from durable successor timing")
+	}
+	return recovery, reasons
+}
+
+func validateClockMapping(mapping clockMapping) error {
+	if mapping.HostLowerBound.IsZero() ||
+		mapping.HostUpperBound.IsZero() ||
+		mapping.ServerTime.IsZero() ||
+		mapping.HostUpperBound.Before(mapping.HostLowerBound) {
+		return errors.New("clock mapping timestamps are incomplete or reversed")
+	}
+	hostRange := mapping.HostUpperBound.Sub(mapping.HostLowerBound)
+	uncertainty := hostRange / 2
+	hostMidpoint := mapping.HostLowerBound.Add(hostRange / 2)
+	if mapping.Uncertainty != uncertainty ||
+		mapping.Offset != mapping.ServerTime.Sub(hostMidpoint) {
+		return errors.New("clock mapping offset or uncertainty is inconsistent")
+	}
+	if mapping.Uncertainty < 0 || mapping.Uncertainty > maxClockUncertainty {
+		return fmt.Errorf("clock mapping uncertainty %s is outside the accepted bound", mapping.Uncertainty)
+	}
+	return nil
+}
+
+func validateActiveLease(lease activeLease) error {
+	if lease.JobID == "" ||
+		lease.AttemptNo < 1 ||
+		lease.Generation < 1 ||
+		lease.LeasedAt.IsZero() {
+		return errors.New("lease identity or durable timestamp is incomplete")
+	}
+	return nil
+}
+
+func decodeStrictJSON(body []byte, target any) error {
+	if len(body) == 0 {
+		return errors.New("details are empty")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func recoverySampleKey(killSequence int, jobID string) string {
+	return strconv.Itoa(killSequence) + "\x00" + jobID
+}
+
+func leaseFenceKey(lease activeLease) string {
+	return fmt.Sprintf("%s/%d/%d", lease.JobID, lease.AttemptNo, lease.Generation)
+}
+
+func clockMappingsEqual(left, right clockMapping) bool {
+	return left.HostLowerBound.Equal(right.HostLowerBound) &&
+		left.HostUpperBound.Equal(right.HostUpperBound) &&
+		left.ServerTime.Equal(right.ServerTime) &&
+		left.Offset == right.Offset &&
+		left.Uncertainty == right.Uncertainty
+}
+
+func durationMilliseconds(value time.Duration) float64 {
+	return float64(value) / float64(time.Millisecond)
 }
 
 func validateReplay(path string) (replayResult, string, []string) {
@@ -693,9 +1205,11 @@ func validateReplay(path string) (replayResult, string, []string) {
 		!validSHA256(input.SHA256) {
 		reasons = append(reasons, "replay measurements are invalid")
 	}
-	qualified := input.Decisions >= requiredReplayDecisions &&
-		input.CleanProcessReplays == requiredReplays &&
-		input.ByteMatchPercent == replayMatchTarget
+	if input.Decisions != requiredReplayDecisions ||
+		input.CleanProcessReplays != requiredReplays {
+		reasons = append(reasons, "replay does not use exactly 50000 decisions and 3 processes")
+	}
+	qualified := input.ByteMatchPercent == replayMatchTarget
 	if input.Passed != qualified {
 		reasons = append(reasons, "passed status does not match exact replay qualifiers")
 	}
@@ -724,14 +1238,26 @@ func validateSLO(path string) (sloResult, string, []string) {
 		reasons = append(reasons, "unsupported schema_version")
 	}
 	if input.GeneratedAt.IsZero() ||
-		strings.TrimSpace(input.RulesFile) == "" ||
-		strings.TrimSpace(input.TestsFile) == "" ||
-		strings.TrimSpace(input.Command) == "" ||
 		input.RecordingRules < 1 {
 		reasons = append(reasons, "SLO provenance is incomplete")
 	}
+	if input.RulesFile != "deploy/prometheus/alerts.yml" ||
+		input.TestsFile != "deploy/prometheus/slo-tests.yml" ||
+		input.Command != "promtool test rules deploy/prometheus/slo-tests.yml" {
+		reasons = append(reasons, "SLO summary does not identify the canonical promtool rules and test command")
+	}
+	if artifactErr := requireRegularArtifacts(
+		filepath.Dir(path),
+		"promtool-check.log",
+		"promtool-test.log",
+	); artifactErr != nil {
+		reasons = append(reasons, artifactErr.Error())
+	}
 	qualified := input.Alerts == requiredSLOAlerts &&
 		input.FireAndRecoveryCases == requiredSLORecoveryCases
+	if !qualified {
+		reasons = append(reasons, "SLO summary does not contain exactly 2 alerts and 2 fire-and-recovery cases")
+	}
 	if input.Passed != qualified {
 		reasons = append(reasons, "passed status does not match exact SLO rule qualifiers")
 	}
@@ -784,18 +1310,31 @@ func validateP5(path, sloPath string, sloQualified bool) (operationsResult, stri
 			reasons = append(reasons, "slo_rule_evidence does not identify the supplied SLO summary")
 		}
 	}
-	liveAlerts := !input.LiveAlertWaitsSkipped &&
-		orderedTimes(input.RecoveryAlertFiredAt, input.RecoveryAlertRecoveredAt) &&
-		orderedTimes(input.QueueAlertFiredAt, input.QueueAlertRecoveredAt)
-	if !input.LiveAlertWaitsSkipped && !liveAlerts {
-		reasons = append(reasons, "live alert timestamps are incomplete or unordered")
+	if same, sameErr := sameDirectory(path, sloPath); sameErr != nil || !same {
+		reasons = append(reasons, "walkthrough and SLO rule evidence are not co-located")
 	}
+	liveAlertTimesPresent := !input.RecoveryAlertFiredAt.IsZero() ||
+		!input.RecoveryAlertRecoveredAt.IsZero() ||
+		!input.QueueAlertFiredAt.IsZero() ||
+		!input.QueueAlertRecoveredAt.IsZero()
+	if input.LiveAlertWaitsSkipped && liveAlertTimesPresent {
+		reasons = append(reasons, "walkthrough marks live alert waits skipped but contains live timestamps")
+	}
+	if !input.LiveAlertWaitsSkipped && !liveAlertTimesPresent {
+		reasons = append(reasons, "walkthrough neither skipped nor recorded live alert observations")
+	}
+	if liveAlertTimesPresent &&
+		(!orderedTimes(input.RecoveryAlertFiredAt, input.RecoveryAlertRecoveredAt) ||
+			!orderedTimes(input.QueueAlertFiredAt, input.QueueAlertRecoveredAt)) {
+		reasons = append(reasons, "supplemental live alert timestamps are incomplete or unordered")
+	}
+	deterministicRules := len(reasons) == 0 && sloQualified
 	result = operationsResult{
-		EvidenceValid:       len(reasons) == 0,
-		Qualified:           len(reasons) == 0 && input.Passed,
-		WorkflowJobs:        len(input.WorkflowJobIDs),
-		AuditEvents:         input.AuditEventCount,
-		LiveAlertsValidated: len(reasons) == 0 && liveAlerts && sloQualified,
+		EvidenceValid:               len(reasons) == 0,
+		Qualified:                   len(reasons) == 0 && input.Passed && sloQualified,
+		WorkflowJobs:                len(input.WorkflowJobIDs),
+		AuditEvents:                 input.AuditEventCount,
+		DeterministicRulesValidated: deterministicRules,
 	}
 	return result, digest, reasons
 }
@@ -944,24 +1483,6 @@ func readStrictJSONLines[T any](path string) ([]T, error) {
 	return records, nil
 }
 
-func countChaosEvents(path string) (int, int, error) {
-	events, err := readStrictJSONLines[chaosEvent](path)
-	if err != nil {
-		return 0, 0, err
-	}
-	workerKills := 0
-	serverKills := 0
-	for _, event := range events {
-		switch event.Type {
-		case "worker_killed":
-			workerKills++
-		case "server_killed":
-			serverKills++
-		}
-	}
-	return workerKills, serverKills, nil
-}
-
 func fileSHA256(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -977,13 +1498,6 @@ func fileSHA256(path string) (string, error) {
 		return "", fmt.Errorf("close %s: %w", path, closeErr)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func nearestRankFloat(values []float64, percentile int) float64 {
-	ordered := slices.Clone(values)
-	slices.Sort(ordered)
-	rank := (percentile*len(ordered) + 99) / 100
-	return ordered[rank-1]
 }
 
 func nearestRankDuration(values []time.Duration, percentile int) time.Duration {
@@ -1043,14 +1557,28 @@ func sameFile(left, right string) (bool, error) {
 	return os.SameFile(leftInfo, rightInfo), nil
 }
 
+func sameDirectory(left, right string) (bool, error) {
+	leftDirectory, err := filepath.Abs(filepath.Dir(left))
+	if err != nil {
+		return false, err
+	}
+	rightDirectory, err := filepath.Abs(filepath.Dir(right))
+	if err != nil {
+		return false, err
+	}
+	return leftDirectory == rightDirectory, nil
+}
+
 func activationText(summary qualificationSummary) string {
 	return fmt.Sprintf(
 		"built: railyard | no-op scheduling rate=%s durable lease grants/min | "+
-			"chaos reconciliation=%d/%d runs | worker reassignment p99=%sms | replay match=%s%%",
+			"chaos reconciliation=%d/%d runs | worker reassignment p99=%sms (n=%d) | "+
+			"replay match=%s%%",
 		formatFloat(summary.Throughput.LeaseGrantsPerMinute),
 		summary.Chaos.ReconciledRuns,
 		summary.Chaos.RequiredRuns,
 		formatMilliseconds(time.Duration(summary.Chaos.RecoveryP99NS)),
+		summary.Chaos.RecoverySamples,
 		formatFloat(summary.Replay.ByteMatchPercent),
 	)
 }

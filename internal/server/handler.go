@@ -205,6 +205,11 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, requestError)
 		return
 	}
+	actor, requestError := requestActor(r)
+	if requestError != nil {
+		writeHTTPError(w, requestError)
+		return
+	}
 
 	var request api.SubmitJobRequest
 	if requestError := s.decodeJSON(w, r, &request); requestError != nil {
@@ -219,7 +224,10 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Job = job
 
-	digest, err := stableDigest(request)
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		api.SubmitJobRequest
+	}{Actor: actor, SubmitJobRequest: request})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -227,6 +235,7 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 
 	created, duplicate, err := s.store.SubmitJob(r.Context(), store.Submission{
 		Job:            request.Job,
+		Actor:          actor,
 		IdempotencyKey: key,
 		RequestDigest:  digest,
 	}, s.config.Now().UTC())
@@ -251,6 +260,11 @@ func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, requestError)
 		return
 	}
+	actor, requestError := requestActor(r)
+	if requestError != nil {
+		writeHTTPError(w, requestError)
+		return
+	}
 
 	var request api.SubmitWorkflowRequest
 	if requestError := s.decodeJSON(w, r, &request); requestError != nil {
@@ -262,7 +276,10 @@ func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	digest, err := stableDigest(request)
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		api.SubmitWorkflowRequest
+	}{Actor: actor, SubmitWorkflowRequest: request})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -270,6 +287,7 @@ func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	jobs, duplicate, err := s.store.SubmitWorkflow(r.Context(), store.WorkflowSubmission{
 		Request:        request,
+		Actor:          actor,
 		IdempotencyKey: key,
 		RequestDigest:  digest,
 	}, s.config.Now().UTC())
@@ -302,6 +320,11 @@ func (s *Server) handleCreateCronTrigger(w http.ResponseWriter, r *http.Request)
 		writeHTTPError(w, requestError)
 		return
 	}
+	actor, requestError := requestActor(r)
+	if requestError != nil {
+		writeHTTPError(w, requestError)
+		return
+	}
 	var request api.CreateCronTriggerRequest
 	if requestError := s.decodeJSON(w, r, &request); requestError != nil {
 		writeHTTPError(w, requestError)
@@ -321,7 +344,10 @@ func (s *Server) handleCreateCronTrigger(w http.ResponseWriter, r *http.Request)
 		writeHTTPError(w, invalidRequest(err.Error()))
 		return
 	}
-	digest, err := stableDigest(request)
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		api.CreateCronTriggerRequest
+	}{Actor: actor, CreateCronTriggerRequest: request})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -334,6 +360,7 @@ func (s *Server) handleCreateCronTrigger(w http.ResponseWriter, r *http.Request)
 				Expression: request.Expression,
 				Job:        request.Job,
 			},
+			Actor:          actor,
 			IdempotencyKey: key,
 			RequestDigest:  digest,
 		},
@@ -394,15 +421,21 @@ func (s *Server) handleRedriveDeadLetter(
 		writeHTTPError(w, requestError)
 		return
 	}
+	actor, requestError := requestActor(r)
+	if requestError != nil {
+		writeHTTPError(w, requestError)
+		return
+	}
 	digest, err := stableDigest(struct {
 		JobID string `json:"job_id"`
-	}{JobID: jobID})
+		Actor string `json:"actor"`
+	}{JobID: jobID, Actor: actor})
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	job, duplicate, err := deadLetters.RedriveDeadLetter(
-		r.Context(),
+		store.WithActor(r.Context(), actor),
 		jobID,
 		key,
 		digest,

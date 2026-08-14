@@ -229,6 +229,7 @@ paths:
       x-payload-execution-semantics: at-least-once
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       requestBody:
         required: true
         content:
@@ -287,6 +288,7 @@ paths:
       x-payload-execution-semantics: at-least-once
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       requestBody:
         required: true
         content:
@@ -342,6 +344,7 @@ paths:
       description: Redrive creates a new job and never reopens the terminal job.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       responses:
         "201":
           description: A replacement job was created.
@@ -374,6 +377,7 @@ paths:
       summary: Create a cron trigger
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       requestBody:
         required: true
         content:

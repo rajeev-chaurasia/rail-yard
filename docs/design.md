@@ -278,10 +278,9 @@ an operator responsibility.
 ## HTTP protocol
 
 All JSON requests reject unknown fields and have body-size limits. Mutating
-control requests require `Idempotency-Key`. Every mutation under
-`/v1/operations` also requires `X-Rail-Yard-Actor`. The older `/v1` mutations
-do not accept an actor, so operator workflows should use the operations facade
-when actor attribution is required.
+control requests require `Idempotency-Key`. Legacy job, workflow, dead-letter
+redrive, and cron trigger mutations also require `X-Rail-Yard-Actor`, using the
+same bounded printable ASCII format as operations mutations.
 
 Control endpoints:
 
@@ -318,10 +317,11 @@ Operations endpoints:
 - `GET /ops/api/runs/{run_id}`
 - `POST /ops/api/actions`
 
-Operations API mutations require an actor header and idempotency key. Dashboard
-mutations require an actor in the request body and the dashboard CSRF cookie
-and header. State history reports `system` for scheduler and worker transitions
-and the supplied actor for operator transitions.
+Operations and legacy control API mutations require an actor header and
+idempotency key. Dashboard mutations require an actor in the request body and
+the dashboard CSRF cookie and header. State history reports `system` for
+scheduler and worker transitions and the supplied actor for attributed control
+transitions.
 
 Worker endpoints:
 

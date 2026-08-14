@@ -15,7 +15,10 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 )
 
-const maxIdempotencyKeyBytes = 256
+const (
+	actorHeaderName     = "X-Rail-Yard-Actor"
+	maxHeaderValueBytes = 256
+)
 
 type httpError struct {
 	status     int
@@ -73,24 +76,32 @@ func decodeError(err error) *httpError {
 }
 
 func idempotencyKey(r *http.Request) (string, *httpError) {
-	values := r.Header.Values("Idempotency-Key")
+	return requiredPrintableHeader(r, "Idempotency-Key")
+}
+
+func requestActor(r *http.Request) (string, *httpError) {
+	return requiredPrintableHeader(r, actorHeaderName)
+}
+
+func requiredPrintableHeader(r *http.Request, name string) (string, *httpError) {
+	values := r.Header.Values(name)
 	if len(values) != 1 {
-		return "", invalidRequest("exactly one Idempotency-Key header is required")
+		return "", invalidRequest("exactly one " + name + " header is required")
 	}
 
-	key := strings.TrimSpace(values[0])
-	if key == "" {
-		return "", invalidRequest("Idempotency-Key must not be empty")
+	value := strings.TrimSpace(values[0])
+	if value == "" {
+		return "", invalidRequest(name + " must not be empty")
 	}
-	if len(key) > maxIdempotencyKeyBytes {
-		return "", invalidRequest("Idempotency-Key exceeds 256 bytes")
+	if len(value) > maxHeaderValueBytes {
+		return "", invalidRequest(name + " exceeds 256 bytes")
 	}
-	for _, character := range key {
+	for _, character := range value {
 		if character < 0x21 || character > 0x7e {
-			return "", invalidRequest("Idempotency-Key must contain printable ASCII without spaces")
+			return "", invalidRequest(name + " must contain printable ASCII without spaces")
 		}
 	}
-	return key, nil
+	return value, nil
 }
 
 func stableDigest(value any) (string, error) {

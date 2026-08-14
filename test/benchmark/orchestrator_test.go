@@ -75,14 +75,20 @@ func TestComposeStartSelectsExactWorkers(t *testing.T) {
 func TestQualificationRequiresCanonicalShape(t *testing.T) {
 	options := validOptions(t)
 	options.runs = 3
-	options.jobs = 50_000
+	options.jobs = 5_000
 	options.workers = 8
+	options.workerSlots = 256
 	if !options.qualification() {
 		t.Fatal("canonical benchmark shape was not treated as qualification")
 	}
 	options.jobs--
 	if options.qualification() {
 		t.Fatal("noncanonical benchmark shape was treated as qualification")
+	}
+	options.jobs++
+	options.workerSlots--
+	if options.qualification() {
+		t.Fatal("noncanonical worker slots were treated as qualification")
 	}
 }
 

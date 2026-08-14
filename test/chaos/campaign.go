@@ -28,6 +28,8 @@ import (
 
 const (
 	minimumWorkerKills         = 1
+	defaultRuns                = 1
+	defaultJobs                = 5_000
 	defaultWorkerKills         = 20
 	databaseService            = "server"
 	maxClockMappingUncertainty = 250 * time.Millisecond

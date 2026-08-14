@@ -115,7 +115,7 @@ func (s *Store) SubmitJob(
 			return domain.Job{}, false, fmt.Errorf("insert job dependency: %w", err)
 		}
 	}
-	if err := appendEvent(
+	if err := appendActorEvent(
 		ctx,
 		tx,
 		job.ID,
@@ -123,9 +123,10 @@ func (s *Store) SubmitJob(
 		job.State,
 		job.StateVersion,
 		now,
-		struct {
-			ReadySeq int64 `json:"ready_seq"`
-		}{ReadySeq: job.ReadySeq},
+		map[string]any{
+			"actor":     submission.Actor,
+			"ready_seq": job.ReadySeq,
+		},
 	); err != nil {
 		return domain.Job{}, false, err
 	}
@@ -278,7 +279,7 @@ func (s *Store) SubmitWorkflow(
 		}
 	}
 	for _, job := range jobs {
-		if err := appendEvent(
+		if err := appendActorEvent(
 			ctx,
 			tx,
 			job.ID,
@@ -286,9 +287,10 @@ func (s *Store) SubmitWorkflow(
 			job.State,
 			job.StateVersion,
 			now,
-			struct {
-				ReadySeq int64 `json:"ready_seq"`
-			}{ReadySeq: job.ReadySeq},
+			map[string]any{
+				"actor":     submission.Actor,
+				"ready_seq": job.ReadySeq,
+			},
 		); err != nil {
 			return nil, false, err
 		}
@@ -641,4 +643,35 @@ func insertJob(ctx context.Context, tx *sql.Tx, job domain.Job) error {
 func timePointer(value time.Time) *time.Time {
 	utc := value.UTC()
 	return &utc
+}
+
+func appendActorEvent(
+	ctx context.Context,
+	tx *sql.Tx,
+	jobID string,
+	eventType string,
+	state domain.JobState,
+	stateVersion int64,
+	now time.Time,
+	payload any,
+) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode %s event: %w", eventType, err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO events
+			(job_id, event_type, state, state_version, occurred_at, payload_json)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		jobID,
+		eventType,
+		state,
+		stateVersion,
+		timeToDB(now),
+		body,
+	); err != nil {
+		return fmt.Errorf("append %s event: %w", eventType, err)
+	}
+	return nil
 }
