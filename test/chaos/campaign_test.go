@@ -317,6 +317,45 @@ func TestRecoveryScoringUsesDurableSuccessorLease(t *testing.T) {
 	}
 }
 
+func TestRecoveryScoringIgnoresCrossClockObservationOrdering(t *testing.T) {
+	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	mapping, err := newClockMapping(killTime, killTime, killTime)
+	if err != nil {
+		t.Fatalf("create clock mapping: %v", err)
+	}
+	kill := workerKill{
+		Sequence:        1,
+		ConfirmedHostAt: killTime,
+		ConfirmedAt:     killTime,
+		ClockMapping:    mapping,
+		Leases: []activeLease{{
+			JobID:      "job-1",
+			AttemptNo:  1,
+			Generation: 1,
+		}},
+		RecoveredAt: map[string]time.Time{"job-1": killTime.Add(time.Second)},
+	}
+	attempts := map[string][]databaseAttempt{
+		"job-1": {
+			{
+				JobID:        "job-1",
+				AttemptNo:    2,
+				Generation:   2,
+				LeasedAt:     killTime.Add(2 * time.Second),
+				CompletionAt: killTime.Add(3 * time.Second),
+			},
+		},
+	}
+
+	samples, err := scoreRecoverySamples([]workerKill{kill}, attempts)
+	if err != nil {
+		t.Fatalf("score recovery with differing clock domains: %v", err)
+	}
+	if len(samples) != 1 || samples[0].RecoveryMS != 2000 {
+		t.Fatalf("recovery samples=%#v", samples)
+	}
+}
+
 func TestRecoveryScoringFailsWithoutSuccessor(t *testing.T) {
 	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 	mapping, err := newClockMapping(killTime, killTime, killTime)

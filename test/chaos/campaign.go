@@ -1786,9 +1786,6 @@ func scoreRecoverySamples(
 			if !exists {
 				return nil, fmt.Errorf("job %s has no observed successor timestamp", killed.JobID)
 			}
-			if observedAt.Add(kill.ClockMapping.Uncertainty).Before(successor.LeasedAt) {
-				return nil, fmt.Errorf("job %s successor observation predates its durable lease", killed.JobID)
-			}
 			if successor.CompletionAt.IsZero() || successor.CompletionAt.Before(successor.LeasedAt) {
 				return nil, fmt.Errorf("job %s successor has no ordered durable completion", killed.JobID)
 			}
