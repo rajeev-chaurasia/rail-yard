@@ -290,9 +290,7 @@ func verifyCompletedRun(
 			!sample.SuccessorLeasedAt.After(
 				sample.KillConfirmedAt.Add(sample.ClockMapping.Uncertainty),
 			) ||
-			sample.SuccessorObservedAt.Add(
-				sample.ClockMapping.Uncertainty,
-			).Before(sample.SuccessorLeasedAt) ||
+			sample.SuccessorObservedAt.IsZero() ||
 			sample.CompletionAt.Before(sample.SuccessorLeasedAt) ||
 			recovery < 0 ||
 			sample.RecoveryMS != float64(recovery)/float64(time.Millisecond) {

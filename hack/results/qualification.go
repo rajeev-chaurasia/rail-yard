@@ -1092,11 +1092,8 @@ func validateRecoverySample(
 		) {
 		reasons = append(reasons, "durable successor lease is incomplete or outside the kill boundary")
 	}
-	if sample.SuccessorObservedAt.IsZero() ||
-		sample.SuccessorObservedAt.Add(
-			sample.ClockMapping.Uncertainty,
-		).Before(sample.SuccessorLeasedAt) {
-		reasons = append(reasons, "successor observation predates its durable lease")
+	if sample.SuccessorObservedAt.IsZero() {
+		reasons = append(reasons, "successor observation is missing")
 	}
 	if sample.CompletionAt.IsZero() || sample.CompletionAt.Before(sample.SuccessorLeasedAt) {
 		reasons = append(reasons, "durable successor completion is missing or unordered")

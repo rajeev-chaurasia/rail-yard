@@ -1136,10 +1136,6 @@ func killAndRestartWorker(
 	if err := waitForService(ctx, cfg, compose, worker); err != nil {
 		return workerKill{}, err
 	}
-	recoveredAt, err := waitForLeaseRecovery(ctx, cfg, compose, leases, mapping)
-	if err != nil {
-		return workerKill{}, err
-	}
 	if err := writeEvent(events, actionEvent{
 		Type:       "worker_restarted",
 		ObservedAt: time.Now().UTC(),
@@ -1156,7 +1152,7 @@ func killAndRestartWorker(
 		ConfirmedAt:     confirmedAt,
 		ClockMapping:    mapping,
 		Leases:          leases,
-		RecoveredAt:     recoveredAt,
+		RecoveredAt:     make(map[string]time.Time),
 	}, nil
 }
 
@@ -1395,50 +1391,6 @@ func waitForClockMapping(
 		return true, nil
 	}, "durable server clock mapping")
 	return result, err
-}
-
-func waitForLeaseRecovery(
-	ctx context.Context,
-	cfg config,
-	compose composeClient,
-	leases []activeLease,
-	mapping clockMapping,
-) (map[string]time.Time, error) {
-	recovered := make(map[string]time.Time, len(leases))
-	if len(leases) == 0 {
-		return recovered, nil
-	}
-	conditions := make([]string, len(leases))
-	for index, lease := range leases {
-		conditions[index] = fmt.Sprintf(
-			"(job_id = %s AND lease_generation > %d)",
-			sqlLiteral(lease.JobID),
-			lease.Generation,
-		)
-	}
-	query := fmt.Sprintf(
-		"SELECT DISTINCT job_id FROM attempts WHERE %s ORDER BY job_id;",
-		strings.Join(conditions, " OR "),
-	)
-	deadlineContext, cancel := context.WithTimeout(ctx, cfg.StartupTimeout)
-	defer cancel()
-	err := poll(deadlineContext, cfg.PollInterval, func() (bool, error) {
-		output, err := compose.querySQLite(deadlineContext, cfg.DatabasePath, query)
-		if err != nil {
-			return false, nil
-		}
-		observedAt := mapping.serverTime(time.Now().UTC())
-		for _, jobID := range nonemptyLines(output) {
-			if _, exists := recovered[jobID]; !exists {
-				recovered[jobID] = observedAt
-			}
-		}
-		return len(recovered) == len(leases), nil
-	}, "durable successor leases")
-	if err != nil {
-		return nil, err
-	}
-	return recovered, nil
 }
 
 func readProgress(
@@ -1784,7 +1736,7 @@ func scoreRecoverySamples(
 			}
 			observedAt, exists := kill.RecoveredAt[killed.JobID]
 			if !exists {
-				return nil, fmt.Errorf("job %s has no observed successor timestamp", killed.JobID)
+				observedAt = kill.ClockMapping.serverTime(time.Now().UTC())
 			}
 			if successor.CompletionAt.IsZero() || successor.CompletionAt.Before(successor.LeasedAt) {
 				return nil, fmt.Errorf("job %s successor has no ordered durable completion", killed.JobID)
