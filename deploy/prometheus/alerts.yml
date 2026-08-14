@@ -11,6 +11,7 @@ groups:
               }[30m]
             )
           )
+          or vector(0)
 
       - record: railyard:slo:ready_start:observations30m
         expr: |
@@ -21,6 +22,7 @@ groups:
               }[30m]
             )
           )
+          or vector(0)
 
       - record: railyard:slo:ready_start:ratio30m
         expr: |
