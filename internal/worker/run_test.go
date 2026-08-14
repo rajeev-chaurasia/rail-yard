@@ -2,10 +2,15 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,6 +203,35 @@ func TestWorkerCancelsAttemptWhenHeartbeatRejectsLease(t *testing.T) {
 	case completion := <-protocol.completions:
 		t.Fatalf("stale attempt was completed: %+v", completion)
 	default:
+	}
+
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdleWorkerSendsEmptyHeartbeat(t *testing.T) {
+	protocol := newFakeProtocol()
+	runner := newBlockingExecutor()
+	ticker := newManualTicker()
+	worker := newTestWorker(t, protocol, runner, ticker, Config{
+		WorkerID: "worker-idle",
+		Slots:    2,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+	registration := receive(t, protocol.registerRequests)
+	if registration.WorkerID != "worker-idle" || registration.Slots != 2 {
+		t.Fatalf("registration = %+v", registration)
+	}
+	_ = receive(t, protocol.acquireRequests)
+
+	ticker.Tick()
+	heartbeat := receive(t, protocol.heartbeats)
+	if heartbeat.Leases == nil || len(heartbeat.Leases) != 0 {
+		t.Fatalf("idle heartbeat leases = %#v, want empty batch", heartbeat.Leases)
 	}
 
 	cancel()
@@ -405,6 +439,404 @@ func TestWorkerFallsBackToSingleCompletionProtocol(t *testing.T) {
 	}
 }
 
+func TestWorkerReregistersAfterAcquireLosesRegistration(t *testing.T) {
+	protocol := newFakeProtocol()
+	runner := newBlockingExecutor()
+	ticker := newManualTicker()
+	worker := newTestWorker(t, protocol, runner, ticker, Config{
+		WorkerID: "worker-1",
+		Slots:    3,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+	initialRegistration := receive(t, protocol.registerRequests)
+	if initialRegistration.WorkerID != "worker-1" || initialRegistration.Slots != 3 {
+		t.Fatalf("initial registration = %+v", initialRegistration)
+	}
+	_ = receive(t, protocol.acquireRequests)
+	protocol.acquireResults <- acquireResult{err: missingWorkerError(
+		"/v1/workers/worker-1/leases/acquire",
+	)}
+
+	restartedRegistration := receive(t, protocol.registerRequests)
+	if restartedRegistration != initialRegistration {
+		t.Fatalf(
+			"restart registration = %+v, want %+v",
+			restartedRegistration,
+			initialRegistration,
+		)
+	}
+	resumedAcquire := receive(t, protocol.acquireRequests)
+	if resumedAcquire.AvailableSlots != 3 {
+		t.Fatalf("available slots = %d, want 3", resumedAcquire.AvailableSlots)
+	}
+	protocol.acquireResults <- acquireResult{response: api.AcquireLeasesResponse{
+		Leases: []domain.Lease{testLease("after-restart", 1)},
+	}}
+	if started := receive(t, runner.started); started.IdempotencyKey != "after-restart-key" {
+		t.Fatalf("started = %+v", started)
+	}
+
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerRetriesFencedStartAcrossRepeatedMissingRegistration(t *testing.T) {
+	protocol := newFakeProtocol()
+	var startCalls atomic.Int32
+	protocol.start = func(api.StartAttemptRequest) error {
+		if startCalls.Add(1) <= 2 {
+			return missingWorkerError("/v1/workers/worker-1/attempts/start")
+		}
+		return nil
+	}
+	runner := newBlockingExecutor()
+	worker := newTestWorker(
+		t,
+		struct{ Protocol }{Protocol: protocol},
+		runner,
+		newManualTicker(),
+		Config{WorkerID: "worker-1", Slots: 1},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+	_ = receive(t, protocol.registerRequests)
+	_ = receive(t, protocol.acquireRequests)
+	lease := testLease("repeated-start", 1)
+	protocol.acquireResults <- acquireResult{response: api.AcquireLeasesResponse{
+		Leases: []domain.Lease{lease},
+	}}
+	firstStart := receive(t, protocol.starts)
+	_ = receive(t, protocol.registerRequests)
+	secondStart := receive(t, protocol.starts)
+	_ = receive(t, protocol.registerRequests)
+	thirdStart := receive(t, protocol.starts)
+	if !sameLease(firstStart, secondStart) || !sameLease(secondStart, thirdStart) {
+		t.Fatalf("start retries changed fencing: %+v, %+v, %+v", firstStart, secondStart, thirdStart)
+	}
+	if started := receive(t, runner.started); started.IdempotencyKey != lease.IdempotencyKey {
+		t.Fatalf("execution = %+v", started)
+	}
+	assertNoValue(t, protocol.registerRequests, "unexpected fourth registration")
+
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerCoalescesConcurrentMissingRegistrationResponses(t *testing.T) {
+	protocol := newFakeProtocol()
+	var registerCalls atomic.Int32
+	reregistering := make(chan struct{})
+	allowRegistration := make(chan struct{})
+	protocol.register = func(
+		ctx context.Context,
+		_ api.RegisterWorkerRequest,
+	) (api.RegisterWorkerResponse, error) {
+		if registerCalls.Add(1) == 1 {
+			return protocol.registerResponse, nil
+		}
+		select {
+		case <-reregistering:
+		default:
+			close(reregistering)
+		}
+		select {
+		case <-allowRegistration:
+			return protocol.registerResponse, nil
+		case <-ctx.Done():
+			return api.RegisterWorkerResponse{}, ctx.Err()
+		}
+	}
+	var registrationMissing atomic.Bool
+	completionBlocked := make(chan struct{})
+	heartbeatBlocked := make(chan struct{})
+	releaseMissingResponses := make(chan struct{})
+	protocol.heartbeat = func(request api.HeartbeatRequest) (api.HeartbeatResponse, error) {
+		if registrationMissing.Load() {
+			close(heartbeatBlocked)
+			<-releaseMissingResponses
+			return api.HeartbeatResponse{}, missingWorkerError(
+				"/v1/workers/worker-1/heartbeats",
+			)
+		}
+		results := make([]api.HeartbeatResult, len(request.Leases))
+		for index, reference := range request.Leases {
+			results[index] = api.HeartbeatResult{JobID: reference.JobID, Accepted: true}
+		}
+		return api.HeartbeatResponse{Results: results}, nil
+	}
+	protocol.completeBatch = func(
+		request api.CompleteAttemptsRequest,
+	) (api.CompleteAttemptsResponse, error) {
+		if registrationMissing.Load() {
+			close(completionBlocked)
+			<-releaseMissingResponses
+			return api.CompleteAttemptsResponse{}, missingWorkerError(
+				"/v1/workers/worker-1/attempts/complete-batch",
+			)
+		}
+		results := make([]api.CompletionResult, len(request.Completions))
+		for index, completion := range request.Completions {
+			results[index] = api.CompletionResult{
+				JobID: completion.JobID,
+				Receipt: &domain.CompletionReceipt{
+					JobID: completion.JobID,
+					State: domain.StateSucceeded,
+				},
+			}
+		}
+		return api.CompleteAttemptsResponse{Results: results}, nil
+	}
+
+	runner := newBlockingExecutor()
+	ticker := newManualTicker()
+	worker := newTestWorker(t, protocol, runner, ticker, Config{
+		WorkerID:            "worker-1",
+		Slots:               2,
+		CompletionBatchSize: 1,
+		CompletionBatchWait: time.Nanosecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+	_ = receive(t, protocol.registerRequests)
+	_ = receive(t, protocol.acquireRequests)
+	protocol.acquireResults <- acquireResult{response: api.AcquireLeasesResponse{
+		Leases: []domain.Lease{
+			testLease("concurrent-a", 1),
+			testLease("concurrent-b", 1),
+		},
+	}}
+	_ = receive(t, runner.started)
+	_ = receive(t, runner.started)
+
+	registrationMissing.Store(true)
+	runner.results <- successfulResult()
+	firstCompletion := receive(t, protocol.completionBatches)
+	<-completionBlocked
+	ticker.Tick()
+	firstHeartbeat := receive(t, protocol.heartbeats)
+	<-heartbeatBlocked
+	close(releaseMissingResponses)
+	<-reregistering
+	restartedRegistration := receive(t, protocol.registerRequests)
+	if restartedRegistration.Slots != 2 {
+		t.Fatalf("restart registration = %+v", restartedRegistration)
+	}
+	assertNoValue(t, protocol.registerRequests, "duplicate restart registration")
+
+	registrationMissing.Store(false)
+	close(allowRegistration)
+	secondCompletion := receive(t, protocol.completionBatches)
+	secondHeartbeat := receive(t, protocol.heartbeats)
+	if len(firstCompletion) != 1 || len(secondCompletion) != 1 ||
+		!sameLease(firstCompletion[0].LeaseRef, secondCompletion[0].LeaseRef) {
+		t.Fatalf("completion retry changed fencing: first=%+v second=%+v", firstCompletion, secondCompletion)
+	}
+	if len(firstHeartbeat.Leases) != 2 || len(secondHeartbeat.Leases) == 0 {
+		t.Fatalf("heartbeats before=%+v after=%+v", firstHeartbeat, secondHeartbeat)
+	}
+	if registerCalls.Load() != 2 {
+		t.Fatalf("register calls = %d, want 2", registerCalls.Load())
+	}
+	assertNoValue(t, runner.canceled, "active lease cancellation")
+
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerCancellationStopsReregistration(t *testing.T) {
+	protocol := newFakeProtocol()
+	var registerCalls atomic.Int32
+	reregistering := make(chan struct{})
+	registerCanceled := make(chan struct{})
+	protocol.register = func(
+		ctx context.Context,
+		_ api.RegisterWorkerRequest,
+	) (api.RegisterWorkerResponse, error) {
+		if registerCalls.Add(1) == 1 {
+			return protocol.registerResponse, nil
+		}
+		close(reregistering)
+		<-ctx.Done()
+		close(registerCanceled)
+		return api.RegisterWorkerResponse{}, ctx.Err()
+	}
+	worker := newTestWorker(t, protocol, newBlockingExecutor(), newManualTicker(), Config{
+		WorkerID: "worker-1",
+		Slots:    1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+	_ = receive(t, protocol.registerRequests)
+	_ = receive(t, protocol.acquireRequests)
+	protocol.acquireResults <- acquireResult{err: missingWorkerError(
+		"/v1/workers/worker-1/leases/acquire",
+	)}
+	<-reregistering
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+	<-registerCanceled
+	if registerCalls.Load() != 2 {
+		t.Fatalf("register calls = %d, want 2", registerCalls.Load())
+	}
+}
+
+func TestWorkerRecoversAcrossServerRestart(t *testing.T) {
+	var mu sync.Mutex
+	registered := false
+	registrations := 0
+	registrationSlots := make([]int, 0, 2)
+	firstLeased := false
+	secondLeased := false
+	firstCompleted := false
+	var missingOnce sync.Once
+	missingSeen := make(chan struct{})
+	var reregisteredOnce sync.Once
+	reregistered := make(chan struct{})
+	var completedOnce sync.Once
+	completed := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/workers/register":
+			var payload api.RegisterWorkerRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode registration: %v", err)
+			}
+			mu.Lock()
+			registered = true
+			registrations++
+			registrationSlots = append(registrationSlots, payload.Slots)
+			count := registrations
+			mu.Unlock()
+			if count > 1 {
+				reregisteredOnce.Do(func() { close(reregistered) })
+			}
+			_ = json.NewEncoder(writer).Encode(api.RegisterWorkerResponse{
+				WorkerID:       payload.WorkerID,
+				HeartbeatEvery: time.Second,
+			})
+		case "/v1/workers/worker-1/leases/acquire":
+			mu.Lock()
+			if !registered {
+				mu.Unlock()
+				writeMissingWorker(writer)
+				return
+			}
+			var leases []domain.Lease
+			switch {
+			case !firstLeased:
+				firstLeased = true
+				leases = []domain.Lease{testLease("restart-first", 1)}
+			case firstCompleted && !secondLeased:
+				secondLeased = true
+				leases = []domain.Lease{testLease("restart-second", 1)}
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(writer).Encode(api.AcquireLeasesResponse{Leases: leases})
+		case "/v1/workers/worker-1/attempts/start":
+			mu.Lock()
+			isRegistered := registered
+			mu.Unlock()
+			if !isRegistered {
+				writeMissingWorker(writer)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		case "/v1/workers/worker-1/attempts/complete":
+			var payload api.CompleteAttemptRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode completion: %v", err)
+			}
+			mu.Lock()
+			if !registered {
+				mu.Unlock()
+				missingOnce.Do(func() { close(missingSeen) })
+				writeMissingWorker(writer)
+				return
+			}
+			if payload.JobID == "restart-first" {
+				firstCompleted = true
+			}
+			mu.Unlock()
+			completedOnce.Do(func() { close(completed) })
+			_ = json.NewEncoder(writer).Encode(domain.CompletionReceipt{
+				JobID: payload.JobID,
+				State: domain.StateSucceeded,
+			})
+		case "/v1/workers/worker-1/heartbeats":
+			mu.Lock()
+			isRegistered := registered
+			mu.Unlock()
+			if !isRegistered {
+				writeMissingWorker(writer)
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(api.HeartbeatResponse{Results: []api.HeartbeatResult{}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newBlockingExecutor()
+	worker := newTestWorker(
+		t,
+		struct{ Protocol }{Protocol: client},
+		runner,
+		newManualTicker(),
+		Config{WorkerID: "worker-1", Slots: 1},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := runWorker(worker, ctx)
+
+	first := receive(t, runner.started)
+	if first.IdempotencyKey != "restart-first-key" {
+		t.Fatalf("first execution = %+v", first)
+	}
+	mu.Lock()
+	registered = false
+	mu.Unlock()
+	runner.results <- successfulResult()
+	<-missingSeen
+	<-reregistered
+	<-completed
+
+	second := receive(t, runner.started)
+	if second.IdempotencyKey != "restart-second-key" {
+		t.Fatalf("second execution = %+v", second)
+	}
+	mu.Lock()
+	gotRegistrations := registrations
+	gotSlots := append([]int(nil), registrationSlots...)
+	mu.Unlock()
+	if gotRegistrations != 2 || !reflect.DeepEqual(gotSlots, []int{1, 1}) {
+		t.Fatalf("registrations = %d, slots = %v", gotRegistrations, gotSlots)
+	}
+
+	cancel()
+	if err := receive(t, runDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerRejectsInvalidConfiguration(t *testing.T) {
 	protocol := newFakeProtocol()
 	runner := newBlockingExecutor()
@@ -455,6 +887,30 @@ func receive[T any](t *testing.T, channel <-chan T) T {
 	}
 }
 
+func assertNoValue[T any](t *testing.T, channel <-chan T, description string) {
+	t.Helper()
+	select {
+	case value := <-channel:
+		t.Fatalf("%s: %+v", description, value)
+	default:
+	}
+}
+
+func missingWorkerError(path string) error {
+	return &APIError{
+		StatusCode: http.StatusNotFound,
+		Code:       "not_found",
+		Message:    "worker is not registered",
+		Method:     http.MethodPost,
+		Path:       path,
+	}
+}
+
+func writeMissingWorker(writer http.ResponseWriter) {
+	writer.WriteHeader(http.StatusNotFound)
+	_, _ = io.WriteString(writer, `{"code":"not_found","message":"worker is not registered"}`)
+}
+
 func testLease(jobID string, slotCost int) domain.Lease {
 	return domain.Lease{
 		JobID:          jobID,
@@ -500,6 +956,7 @@ func (t *manualTicker) Tick() {
 type fakeProtocol struct {
 	registerResponse  api.RegisterWorkerResponse
 	registerErr       error
+	registerRequests  chan api.RegisterWorkerRequest
 	acquireRequests   chan api.AcquireLeasesRequest
 	acquireResults    chan acquireResult
 	starts            chan domain.LeaseRef
@@ -512,6 +969,7 @@ type fakeProtocol struct {
 	heartbeat         func(api.HeartbeatRequest) (api.HeartbeatResponse, error)
 	complete          func(api.CompleteAttemptRequest) (domain.CompletionReceipt, error)
 	completeBatch     func(api.CompleteAttemptsRequest) (api.CompleteAttemptsResponse, error)
+	register          func(context.Context, api.RegisterWorkerRequest) (api.RegisterWorkerResponse, error)
 }
 
 func newFakeProtocol() *fakeProtocol {
@@ -520,6 +978,7 @@ func newFakeProtocol() *fakeProtocol {
 			WorkerID:       "worker-1",
 			HeartbeatEvery: time.Second,
 		},
+		registerRequests:  make(chan api.RegisterWorkerRequest, 16),
 		acquireRequests:   make(chan api.AcquireLeasesRequest, 16),
 		acquireResults:    make(chan acquireResult, 16),
 		starts:            make(chan domain.LeaseRef, 16),
@@ -544,9 +1003,17 @@ func newFakeProtocol() *fakeProtocol {
 }
 
 func (p *fakeProtocol) Register(
-	context.Context,
-	api.RegisterWorkerRequest,
+	ctx context.Context,
+	request api.RegisterWorkerRequest,
 ) (api.RegisterWorkerResponse, error) {
+	select {
+	case p.registerRequests <- request:
+	case <-ctx.Done():
+		return api.RegisterWorkerResponse{}, ctx.Err()
+	}
+	if p.register != nil {
+		return p.register(ctx, request)
+	}
 	return p.registerResponse, p.registerErr
 }
 

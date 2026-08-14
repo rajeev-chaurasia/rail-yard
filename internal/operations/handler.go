@@ -99,6 +99,8 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("/v1/operations/workers", h.handleListWorkerHealth)
 	h.mux.HandleFunc("/v1/operations/dags/{dag_id}", h.handleGetDAG)
 	h.mux.HandleFunc("/v1/operations/jobs/{job_id}/force", h.handleForceJob)
+	h.mux.HandleFunc("/v1/operations/operator-actions", h.handleOperatorAction)
+	h.mux.HandleFunc("/v1/operations/audit-events", h.handleAuditEvents)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "route not found", 0)
 	})
@@ -113,19 +115,28 @@ func (h *Handler) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, requestErr)
 		return
 	}
+	actor, requestErr := requiredHeader(r, h.config.ActorHeader)
+	if requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
 	var request api.SubmitJobRequest
 	if requestErr := h.decodeJSON(w, r, &request); requestErr != nil {
 		writeRequestError(w, requestErr)
 		return
 	}
 	request = normalizeJobRequest(request)
-	digest, err := stableDigest(request)
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		api.SubmitJobRequest
+	}{Actor: actor, SubmitJobRequest: request})
 	if err != nil {
 		writeRepositoryError(w, err)
 		return
 	}
 	response, err := h.repositories.JobSubmitter.SubmitJob(r.Context(), SubmitJobCommand{
 		Request:        request,
+		Actor:          actor,
 		IdempotencyKey: key,
 		RequestDigest:  digest,
 		RequestedAt:    h.config.Now().UTC(),
@@ -150,19 +161,28 @@ func (h *Handler) handleSubmitDAG(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, requestErr)
 		return
 	}
+	actor, requestErr := requiredHeader(r, h.config.ActorHeader)
+	if requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
 	var request api.SubmitWorkflowRequest
 	if requestErr := h.decodeJSON(w, r, &request); requestErr != nil {
 		writeRequestError(w, requestErr)
 		return
 	}
 	request = normalizeDAGRequest(request)
-	digest, err := stableDigest(request)
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		api.SubmitWorkflowRequest
+	}{Actor: actor, SubmitWorkflowRequest: request})
 	if err != nil {
 		writeRepositoryError(w, err)
 		return
 	}
 	response, err := h.repositories.DAGSubmitter.SubmitDAG(r.Context(), SubmitDAGCommand{
 		Request:        request,
+		Actor:          actor,
 		IdempotencyKey: key,
 		RequestDigest:  digest,
 		RequestedAt:    h.config.Now().UTC(),
@@ -407,6 +427,90 @@ func (h *Handler) handleForceJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, receipt)
 }
 
+func (h *Handler) handleOperatorAction(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	actor, requestErr := requiredHeader(r, h.config.ActorHeader)
+	if requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
+	key, requestErr := requiredHeader(r, "Idempotency-Key")
+	if requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
+	var request OperatorActionRequest
+	if requestErr := h.decodeJSON(w, r, &request); requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
+	if request.TenantID == "" {
+		request.TenantID = "default"
+	}
+	if requestErr := validateOperatorAction(request); requestErr != nil {
+		writeRequestError(w, requestErr)
+		return
+	}
+	digest, err := stableDigest(struct {
+		Actor string `json:"actor"`
+		OperatorActionRequest
+	}{Actor: actor, OperatorActionRequest: request})
+	if err != nil {
+		writeRepositoryError(w, err)
+		return
+	}
+	response, err := h.repositories.OperatorActionRecorder.RecordOperatorAction(
+		r.Context(),
+		OperatorActionCommand{
+			Request:        request,
+			Actor:          actor,
+			IdempotencyKey: key,
+			RequestDigest:  digest,
+			RequestedAt:    h.config.Now().UTC(),
+		},
+	)
+	if err != nil {
+		writeRepositoryError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if response.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, response)
+}
+
+func (h *Handler) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	query := AuditEventQuery{Since: time.Unix(0, 0).UTC()}
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeRequestError(w, &RequestError{Message: "since must be an RFC3339 timestamp"})
+			return
+		}
+		query.Since = parsed.UTC()
+	}
+	query.Actor = r.URL.Query().Get("actor")
+	if strings.TrimSpace(query.Actor) != query.Actor {
+		writeRequestError(w, &RequestError{Message: "actor must not have surrounding whitespace"})
+		return
+	}
+	response, err := h.repositories.AuditEventReader.ListAuditEvents(r.Context(), query)
+	if err != nil {
+		writeRepositoryError(w, err)
+		return
+	}
+	if response.Events == nil {
+		response.Events = []AuditEvent{}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (h *Handler) mutationHeaders(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -549,6 +653,31 @@ func validateReason(reason string) *RequestError {
 	return nil
 }
 
+func validateOperatorAction(request OperatorActionRequest) *RequestError {
+	for name, value := range map[string]string{
+		"tenant_id":   request.TenantID,
+		"action":      request.Action,
+		"target_type": request.TargetType,
+		"target_id":   request.TargetID,
+	} {
+		if requestErr := validateIdentifier(name, value); requestErr != nil {
+			return requestErr
+		}
+	}
+	if len(request.Details) > 64 {
+		return &RequestError{Message: "details exceeds 64 entries"}
+	}
+	for key, value := range request.Details {
+		if requestErr := validateIdentifier("details key", key); requestErr != nil {
+			return requestErr
+		}
+		if len(value) > 2048 {
+			return &RequestError{Message: "details value exceeds 2048 bytes"}
+		}
+	}
+	return nil
+}
+
 func requiredHeader(r *http.Request, name string) (string, *RequestError) {
 	values := r.Header.Values(name)
 	if len(values) != 1 {
@@ -600,6 +729,8 @@ func validateRepositories(repositories Repositories) error {
 		{"worker health reader", repositories.WorkerHealthReader},
 		{"DAG reader", repositories.DAGReader},
 		{"force job controller", repositories.ForceJobController},
+		{"operator action recorder", repositories.OperatorActionRecorder},
+		{"audit event reader", repositories.AuditEventReader},
 	}
 	for _, value := range required {
 		if value.repository == nil {

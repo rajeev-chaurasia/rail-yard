@@ -3,17 +3,29 @@ info:
   title: Rail Yard API
   version: 1.0.0
   description: |
-    Rail Yard exposes control-plane, worker, and P5 operations APIs.
+    Rail Yard exposes control-plane, worker, P5 operations, metrics, and
+    operator dashboard HTTP surfaces.
 
     Acceptance and canonical terminal outcomes are durable and idempotent.
     Payload execution is at least once. A worker can complete an external side
     effect and lose its lease before reporting completion, so a later attempt
     can execute the payload again. The lease `idempotency_key` must be honored
     by external payloads that require idempotent side effects.
+
+    Every mutation under `/v1/operations` requires
+    `X-Rail-Yard-Actor`. The older `/v1` control-plane mutations do not accept
+    an actor header and therefore do not provide the actor-attributed
+    operations contract. Dashboard mutations carry the required actor in the
+    JSON body and require the dashboard CSRF cookie and header.
+
+    The reference server does not implement authentication or authorization,
+    so this document declares no security scheme. Deployments must add those
+    controls at the network boundary before exposing operator routes.
   x-payload-execution-semantics: at-least-once
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 servers:
   - url: /
+security: []
 tags:
   - name: Health
   - name: Jobs
@@ -22,7 +34,162 @@ tags:
   - name: Triggers
   - name: Workers
   - name: P5 Operations
+  - name: Metrics
+  - name: Operations dashboard
 paths:
+  /metrics:
+    get:
+      tags: [Metrics]
+      operationId: getPrometheusMetrics
+      summary: Scrape Prometheus metrics
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /ops:
+    get:
+      tags: [Operations dashboard]
+      operationId: redirectOperationsDashboard
+      summary: Redirect to the dashboard root
+      responses:
+        "308":
+          description: Permanent redirect to `/ops/`.
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+                const: /ops/
+  /ops/:
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboard
+      summary: Get the operator dashboard
+      responses:
+        "200":
+          description: Server-rendered operator dashboard.
+          headers:
+            Set-Cookie:
+              description: SameSite CSRF cookie used by dashboard mutations.
+              schema:
+                type: string
+          content:
+            text/html:
+              schema:
+                type: string
+        "500":
+          $ref: "#/components/responses/DashboardError"
+  /ops/assets/app.css:
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboardStylesheet
+      summary: Get the dashboard stylesheet
+      responses:
+        "200":
+          description: Dashboard stylesheet.
+          content:
+            text/css:
+              schema:
+                type: string
+  /ops/assets/app.js:
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboardScript
+      summary: Get the dashboard script
+      responses:
+        "200":
+          description: Dashboard JavaScript.
+          content:
+            text/javascript:
+              schema:
+                type: string
+  /ops/api/snapshot:
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboardSnapshot
+      summary: Get the dashboard operational snapshot
+      responses:
+        "200":
+          description: Current queue, job, and worker snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSnapshot"
+        "503":
+          $ref: "#/components/responses/DashboardError"
+  /ops/api/dead-letters:
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboardDeadLetters
+      summary: Get up to 100 dead letters for the dashboard
+      responses:
+        "200":
+          description: Dead letters ordered by creation time and job ID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeadLetterListResponse"
+        "503":
+          $ref: "#/components/responses/DashboardError"
+  /ops/api/runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    get:
+      tags: [Operations dashboard]
+      operationId: getOperationsDashboardRun
+      summary: Get one DAG run for the dashboard
+      responses:
+        "200":
+          description: Current DAG run nodes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardRun"
+        "400":
+          $ref: "#/components/responses/DashboardError"
+        "404":
+          $ref: "#/components/responses/DashboardError"
+        "503":
+          $ref: "#/components/responses/DashboardError"
+  /ops/api/actions:
+    post:
+      tags: [Operations dashboard]
+      operationId: applyOperationsDashboardAction
+      summary: Apply an actor-attributed dashboard mutation
+      description: |
+        Obtain the CSRF cookie from `GET /ops/`, then send the same token in
+        `X-CSRF-Token`. The JSON body requires a non-empty actor.
+      parameters:
+        - $ref: "#/components/parameters/DashboardCSRFHeader"
+        - $ref: "#/components/parameters/DashboardCSRFCookie"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DashboardActionRequest"
+      responses:
+        "200":
+          description: The dashboard mutation was accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardOperationResult"
+        "400":
+          $ref: "#/components/responses/DashboardError"
+        "403":
+          $ref: "#/components/responses/DashboardError"
+        "404":
+          $ref: "#/components/responses/DashboardError"
+        "409":
+          $ref: "#/components/responses/DashboardError"
+        "415":
+          $ref: "#/components/responses/DashboardError"
+        "503":
+          $ref: "#/components/responses/DashboardError"
   /health/live:
     get:
       tags: [Health]
@@ -450,6 +617,7 @@ paths:
       x-payload-execution-semantics: at-least-once
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       requestBody:
         required: true
         content:
@@ -488,6 +656,7 @@ paths:
       x-payload-execution-semantics: at-least-once
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
       requestBody:
         required: true
         content:
@@ -721,6 +890,60 @@ paths:
           $ref: "#/components/responses/RequestTooLarge"
         "500":
           $ref: "#/components/responses/InternalError"
+  /v1/operations/operator-actions:
+    post:
+      tags: [P5 Operations]
+      operationId: operationsRecordOperatorAction
+      summary: Record an external operator action
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperatorActionRequest"
+      responses:
+        "201":
+          description: The operator action and audit event were recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorActionResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/audit-events:
+    get:
+      tags: [P5 Operations]
+      operationId: operationsListAuditEvents
+      summary: List durable operations audit events
+      parameters:
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditActor"
+      responses:
+        "200":
+          description: Audit events ordered by occurrence time and ID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEventResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   parameters:
     IdempotencyKey:
@@ -781,6 +1004,29 @@ components:
         type: string
         minLength: 1
         maxLength: 128
+    RunID:
+      name: run_id
+      in: path
+      required: true
+      description: Printable identifier without spaces, slashes, or backslashes.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    DashboardCSRFHeader:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{64}$"
+    DashboardCSRFCookie:
+      name: railyard_ops_csrf
+      in: cookie
+      required: true
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{64}$"
     HistoryLimit:
       name: limit
       in: query
@@ -800,6 +1046,20 @@ components:
         type: integer
         format: int64
         minimum: 1
+    AuditSince:
+      name: since
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    AuditActor:
+      name: actor
+      in: query
+      required: false
+      schema:
+        type: string
+        maxLength: 256
   responses:
     BadRequest:
       description: Invalid request.
@@ -861,6 +1121,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    DashboardError:
+      description: Dashboard request or backend error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DashboardError"
   schemas:
     HealthResponse:
       type: object
@@ -1121,6 +1387,7 @@ components:
       properties:
         dead_letters:
           type: array
+          maxItems: 100
           items:
             $ref: "#/components/schemas/DeadLetter"
     RedriveDeadLetterResponse:
@@ -1197,6 +1464,7 @@ components:
         slots:
           type: integer
           minimum: 1
+          maximum: 1024
     RegisterWorkerResponse:
       type: object
       additionalProperties: false
@@ -1223,9 +1491,11 @@ components:
         available_slots:
           type: integer
           minimum: 1
+          maximum: 1024
         limit:
           type: integer
           minimum: 1
+          maximum: 1024
     LeaseRef:
       type: object
       additionalProperties: false
@@ -1253,6 +1523,7 @@ components:
         - token
         - worker_id
         - expires_at
+        - ready_at
         - idempotency_key
         - slot_cost
         - payload
@@ -1273,6 +1544,9 @@ components:
         expires_at:
           type: string
           format: date-time
+        ready_at:
+          type: string
+          format: date-time
         idempotency_key:
           type: string
           description: Stable key for idempotent payload side effects.
@@ -1288,16 +1562,16 @@ components:
       properties:
         leases:
           type: array
+          maxItems: 1024
           items:
             $ref: "#/components/schemas/Lease"
     HeartbeatRequest:
       type: object
       additionalProperties: false
-      required: [leases]
       properties:
         leases:
           type: array
-          minItems: 1
+          maxItems: 1024
           items:
             $ref: "#/components/schemas/LeaseRef"
     HeartbeatResult:
@@ -1319,6 +1593,7 @@ components:
       properties:
         results:
           type: array
+          maxItems: 1024
           items:
             $ref: "#/components/schemas/HeartbeatResult"
     StartAttemptRequest:
@@ -1352,6 +1627,7 @@ components:
       properties:
         results:
           type: array
+          maxItems: 128
           items:
             $ref: "#/components/schemas/StartResult"
     CompleteAttemptRequest:
@@ -1415,6 +1691,7 @@ components:
       properties:
         results:
           type: array
+          maxItems: 128
           items:
             $ref: "#/components/schemas/CompletionResult"
     CompletionReceipt:
@@ -1670,6 +1947,294 @@ components:
         updated_at:
           type: string
           format: date-time
+    OperatorActionRequest:
+      type: object
+      additionalProperties: false
+      required: [action, target_type, target_id]
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          default: default
+        action:
+          type: string
+          minLength: 1
+          maxLength: 128
+        target_type:
+          type: string
+          minLength: 1
+          maxLength: 128
+        target_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        details:
+          type: object
+          maxProperties: 64
+          propertyNames:
+            minLength: 1
+            maxLength: 128
+          additionalProperties:
+            type: string
+            maxLength: 2048
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - tenant_id
+        - action
+        - actor
+        - occurred_at
+        - target_type
+        - target_id
+      properties:
+        id:
+          type: string
+        tenant_id:
+          type: string
+        action:
+          type: string
+        actor:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        target_type:
+          type: string
+        target_id:
+          type: string
+        details:
+          type: object
+          additionalProperties:
+            type: string
+    OperatorActionResponse:
+      type: object
+      additionalProperties: false
+      required: [event, duplicate]
+      properties:
+        event:
+          $ref: "#/components/schemas/AuditEvent"
+        duplicate:
+          type: boolean
+    AuditEventResponse:
+      type: object
+      additionalProperties: false
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+    DashboardSnapshot:
+      type: object
+      additionalProperties: false
+      required: [generated_at, queue_depths, running_jobs, failed_jobs, workers]
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        queue_depths:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardQueueDepth"
+        running_jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardJobSummary"
+        failed_jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardJobSummary"
+        workers:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardWorkerSummary"
+    DashboardQueueDepth:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, queue, state, depth]
+      properties:
+        tenant_id:
+          type: string
+        queue:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        depth:
+          type: integer
+          minimum: 0
+    DashboardJobSummary:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, queue, state, attempt_no, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        tenant_id:
+          type: string
+        queue:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        attempt_no:
+          type: integer
+          minimum: 0
+        updated_at:
+          type: string
+          format: date-time
+        failure:
+          $ref: "#/components/schemas/Failure"
+    DashboardWorkerSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - healthy
+        - capacity
+        - used_slots
+        - active_leases
+        - last_heartbeat_at
+      properties:
+        id:
+          type: string
+        healthy:
+          type: boolean
+        capacity:
+          type: integer
+          minimum: 0
+        used_slots:
+          type: integer
+          minimum: 0
+        active_leases:
+          type: integer
+          minimum: 0
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        oldest_lease_started_at:
+          type: string
+          format: date-time
+        nearest_lease_expiry:
+          type: string
+          format: date-time
+    DashboardRun:
+      type: object
+      additionalProperties: false
+      required: [id, nodes]
+      properties:
+        id:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/DashboardRunNode"
+    DashboardRunNode:
+      type: object
+      additionalProperties: false
+      required: [id, state, attempt_no, depends_on, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        attempt_no:
+          type: integer
+          minimum: 0
+        depends_on:
+          type: array
+          items:
+            type: string
+        updated_at:
+          type: string
+          format: date-time
+    DashboardActionRequest:
+      type: object
+      additionalProperties: false
+      required: [action, job_id, actor]
+      properties:
+        action:
+          type: string
+          enum: [cancel, retry, force, redrive]
+        force_action:
+          type: string
+          enum: [release, fail, dead_letter]
+        job_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 128
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+      allOf:
+        - if:
+            properties:
+              action:
+                const: force
+            required: [action]
+          then:
+            properties:
+              force_action: {}
+              reason: {}
+            required: [force_action, reason]
+          else:
+            properties:
+              force_action: false
+        - if:
+            properties:
+              action:
+                const: cancel
+            required: [action]
+          then:
+            properties:
+              reason: {}
+            required: [reason]
+        - if:
+            properties:
+              action:
+                enum: [retry, redrive]
+            required: [action]
+          then:
+            properties:
+              reason: false
+    DashboardOperationResult:
+      type: object
+      additionalProperties: false
+      required: [action, job_id, message]
+      properties:
+        action:
+          type: string
+          enum: [cancel, retry, force, redrive]
+        job_id:
+          type: string
+        created_job_id:
+          type: string
+        message:
+          type: string
+    DashboardError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
     Error:
       type: object
       additionalProperties: false

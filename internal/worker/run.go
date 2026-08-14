@@ -174,11 +174,16 @@ func (w *Worker) Run(ctx context.Context) error {
 	attemptEvents := make(chan attemptEvent, channelSize)
 	completionEvents := make(chan completionEvent, channelSize)
 	heartbeatEvents := make(chan heartbeatEvent, 1)
+	registrationEvents := make(chan registrationEvent, 1)
 	active := make(map[attemptKey]*attemptState)
 	usedSlots := 0
 	acquiring := false
 	acquirePaused := false
 	heartbeatInFlight := false
+	registrationNeeded := false
+	registrationInFlight := false
+	var registrationEpoch uint64
+	var deferredAcquire *acquireResult
 	batchStartProtocol, batchStarts := w.protocol.(BatchAttemptStartProtocol)
 	batchProtocol, batchCompletions := w.protocol.(BatchCompletionProtocol)
 	var completionTimer *time.Timer
@@ -190,6 +195,34 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}()
 	var goroutines sync.WaitGroup
+
+	startRegistration := func() {
+		acquirePaused = true
+		registrationNeeded = true
+		if registrationInFlight {
+			return
+		}
+		registrationInFlight = true
+		goroutines.Add(1)
+		go func() {
+			defer goroutines.Done()
+			response, registerErr := w.protocol.Register(ctx, api.RegisterWorkerRequest{
+				WorkerID: workerID,
+				Slots:    w.config.Slots,
+			})
+			if registerErr == nil && response.WorkerID != "" && response.WorkerID != workerID {
+				registerErr = fmt.Errorf(
+					"re-register worker: response worker ID %q does not match %q",
+					response.WorkerID,
+					workerID,
+				)
+			}
+			select {
+			case registrationEvents <- registrationEvent{err: registerErr}:
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	removeAttempt := func(key attemptKey) {
 		state, ok := active[key]
@@ -203,22 +236,23 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	startAcquire := func() {
 		available := w.config.Slots - usedSlots
-		if acquiring || acquirePaused || available <= 0 {
+		if acquiring || acquirePaused || registrationNeeded || available <= 0 {
 			return
 		}
 		acquiring = true
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func(availableSlots int) {
+		go func(availableSlots int, requestEpoch uint64) {
 			defer goroutines.Done()
 			response, acquireErr := w.protocol.AcquireLeases(ctx, workerID, api.AcquireLeasesRequest{
 				AvailableSlots: availableSlots,
 				Limit:          w.config.LeaseBatch,
 			})
 			select {
-			case acquired <- acquireResult{response: response, err: acquireErr}:
+			case acquired <- acquireResult{response: response, err: acquireErr, epoch: requestEpoch}:
 			case <-ctx.Done():
 			}
-		}(available)
+		}(available, epoch)
 	}
 
 	executeAttempt := func(lease domain.Lease, key attemptKey, attemptCtx context.Context) {
@@ -237,8 +271,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	startAttempt := func(key attemptKey, state *attemptState) {
+		state.startInFlight = true
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func() {
+		go func(requestEpoch uint64) {
 			defer goroutines.Done()
 			startErr := w.protocol.StartAttempt(
 				state.ctx,
@@ -246,15 +282,26 @@ func (w *Worker) Run(ctx context.Context) error {
 				api.StartAttemptRequest{LeaseRef: leaseRef(state.lease)},
 			)
 			select {
-			case attemptEvents <- attemptEvent{key: key, startErr: startErr, started: true}:
+			case attemptEvents <- attemptEvent{
+				key:      key,
+				startErr: startErr,
+				started:  true,
+				epoch:    requestEpoch,
+			}:
 			case <-ctx.Done():
 			}
-		}()
+		}(epoch)
 	}
 
 	startAttemptBatch := func(keys []attemptKey, refs []domain.LeaseRef) {
+		for _, key := range keys {
+			if state, ok := active[key]; ok {
+				state.startInFlight = true
+			}
+		}
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func() {
+		go func(requestEpoch uint64) {
 			defer goroutines.Done()
 			response, batchErr := batchStartProtocol.StartAttempts(
 				ctx,
@@ -268,12 +315,13 @@ func (w *Worker) Run(ctx context.Context) error {
 					key:      key,
 					startErr: errs[index],
 					started:  true,
+					epoch:    requestEpoch,
 				}:
 				case <-ctx.Done():
 					return
 				}
 			}
-		}()
+		}(epoch)
 	}
 
 	startAttempts := func(keys []attemptKey) {
@@ -299,25 +347,28 @@ func (w *Worker) Run(ctx context.Context) error {
 		state.completionAttempts++
 		completion := completionFor(workerID, state.lease, state.result)
 		attemptCtx := state.ctx
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func() {
+		go func(requestEpoch uint64) {
 			defer goroutines.Done()
 			_, completeErr := w.protocol.CompleteAttempt(attemptCtx, workerID, api.CompleteAttemptRequest{
 				Completion: completion,
 			})
 			select {
 			case completionEvents <- completionEvent{
-				keys: []attemptKey{key},
-				errs: []error{completeErr},
+				keys:  []attemptKey{key},
+				errs:  []error{completeErr},
+				epoch: requestEpoch,
 			}:
 			case <-ctx.Done():
 			}
-		}()
+		}(epoch)
 	}
 
 	startCompletionBatch := func(keys []attemptKey, completions []domain.Completion) {
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func() {
+		go func(requestEpoch uint64) {
 			defer goroutines.Done()
 			response, batchErr := batchProtocol.CompleteAttempts(
 				ctx,
@@ -326,10 +377,10 @@ func (w *Worker) Run(ctx context.Context) error {
 			)
 			errs := completionBatchErrors(response, completions, batchErr)
 			select {
-			case completionEvents <- completionEvent{keys: keys, errs: errs}:
+			case completionEvents <- completionEvent{keys: keys, errs: errs, epoch: requestEpoch}:
 			case <-ctx.Done():
 			}
-		}()
+		}(epoch)
 	}
 
 	flushCompletions := func() {
@@ -383,7 +434,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	startHeartbeat := func() {
-		if heartbeatInFlight || len(active) == 0 {
+		if heartbeatInFlight || registrationNeeded {
 			return
 		}
 		refs := make([]domain.LeaseRef, 0, len(active))
@@ -391,8 +442,9 @@ func (w *Worker) Run(ctx context.Context) error {
 			refs = append(refs, leaseRef(state.lease))
 		}
 		heartbeatInFlight = true
+		epoch := registrationEpoch
 		goroutines.Add(1)
-		go func(requested []domain.LeaseRef) {
+		go func(requested []domain.LeaseRef, requestEpoch uint64) {
 			defer goroutines.Done()
 			heartbeatCtx, cancel := context.WithTimeout(ctx, heartbeatInterval)
 			defer cancel()
@@ -400,10 +452,60 @@ func (w *Worker) Run(ctx context.Context) error {
 				Leases: requested,
 			})
 			select {
-			case heartbeatEvents <- heartbeatEvent{requested: requested, response: response, err: heartbeatErr}:
+			case heartbeatEvents <- heartbeatEvent{
+				requested: requested,
+				response:  response,
+				err:       heartbeatErr,
+				epoch:     requestEpoch,
+			}:
 			case <-ctx.Done():
 			}
-		}(refs)
+		}(refs, epoch)
+	}
+
+	processAcquired := func(result acquireResult) {
+		if result.err != nil {
+			if workerRegistrationMissing(result.err) {
+				if result.epoch == registrationEpoch || registrationNeeded {
+					startRegistration()
+				} else {
+					acquirePaused = false
+					startAcquire()
+				}
+				return
+			}
+			acquirePaused = true
+			return
+		}
+
+		remaining := w.config.Slots - usedSlots
+		startKeys := make([]attemptKey, 0, len(result.response.Leases))
+		for _, lease := range result.response.Leases {
+			key := keyFor(lease)
+			if lease.SlotCost < 1 || lease.SlotCost > remaining {
+				continue
+			}
+			if lease.WorkerID != "" && lease.WorkerID != workerID {
+				continue
+			}
+			if _, exists := active[key]; exists || hasActiveJob(active, lease.JobID) {
+				continue
+			}
+
+			attemptCtx, cancel := context.WithCancel(ctx)
+			state := &attemptState{
+				lease:  lease,
+				ctx:    attemptCtx,
+				cancel: cancel,
+				phase:  attemptStarting,
+			}
+			active[key] = state
+			usedSlots += lease.SlotCost
+			remaining -= lease.SlotCost
+			startKeys = append(startKeys, key)
+		}
+		startAttempts(startKeys)
+		startAcquire()
 	}
 
 	startAcquire()
@@ -420,56 +522,45 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		case result := <-acquired:
 			acquiring = false
-			if result.err != nil {
-				if ctx.Err() != nil {
-					w.shutdown(workerID, active, &goroutines)
-					return nil
-				}
-				acquirePaused = true
+			if ctx.Err() != nil {
+				w.shutdown(workerID, active, &goroutines)
+				return nil
+			}
+			if result.err == nil && registrationNeeded {
+				pending := result
+				deferredAcquire = &pending
 				continue
 			}
-
-			remaining := w.config.Slots - usedSlots
-			startKeys := make([]attemptKey, 0, len(result.response.Leases))
-			for _, lease := range result.response.Leases {
-				key := keyFor(lease)
-				if lease.SlotCost < 1 || lease.SlotCost > remaining {
-					continue
-				}
-				if lease.WorkerID != "" && lease.WorkerID != workerID {
-					continue
-				}
-				if _, exists := active[key]; exists || hasActiveJob(active, lease.JobID) {
-					continue
-				}
-
-				attemptCtx, cancel := context.WithCancel(ctx)
-				state := &attemptState{
-					lease:  lease,
-					ctx:    attemptCtx,
-					cancel: cancel,
-					phase:  attemptStarting,
-				}
-				active[key] = state
-				usedSlots += lease.SlotCost
-				remaining -= lease.SlotCost
-				startKeys = append(startKeys, key)
-			}
-			startAttempts(startKeys)
-			startAcquire()
+			processAcquired(result)
 
 		case event := <-attemptEvents:
 			state, ok := active[event.key]
 			if !ok {
 				continue
 			}
+			if event.started {
+				state.startInFlight = false
+			}
 			if event.startErr != nil {
+				if workerRegistrationMissing(event.startErr) {
+					if event.epoch < registrationEpoch && !registrationNeeded {
+						startAttempts([]attemptKey{event.key})
+					} else {
+						state.startRetryPending = true
+						startRegistration()
+					}
+					continue
+				}
 				removeAttempt(event.key)
 				startAcquire()
 				continue
 			}
 			if event.started {
 				if state.phase != attemptStarting {
+					continue
+				}
+				if registrationNeeded {
+					state.executePending = true
 					continue
 				}
 				state.phase = attemptExecuting
@@ -494,6 +585,19 @@ func (w *Worker) Run(ctx context.Context) error {
 					removeAttempt(key)
 					continue
 				}
+				if workerRegistrationMissing(completionErr) {
+					if state.completionAttempts > 0 {
+						state.completionAttempts--
+					}
+					state.phase = attemptReadyToComplete
+					if event.epoch < registrationEpoch && !registrationNeeded {
+						queueCompletion(key, state)
+					} else {
+						state.completionRetryPending = true
+						startRegistration()
+					}
+					continue
+				}
 				if retryableProtocolError(completionErr) &&
 					state.completionAttempts < w.config.MaxCompletionAttempts {
 					state.phase = attemptReadyToComplete
@@ -507,6 +611,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		case event := <-heartbeatEvents:
 			heartbeatInFlight = false
 			if event.err != nil {
+				if workerRegistrationMissing(event.err) {
+					if event.epoch < registrationEpoch && !registrationNeeded {
+						startHeartbeat()
+					} else {
+						startRegistration()
+					}
+				}
 				continue
 			}
 			for _, result := range event.response.Results {
@@ -525,12 +636,56 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 			startAcquire()
 
+		case event := <-registrationEvents:
+			registrationInFlight = false
+			if event.err != nil {
+				if ctx.Err() != nil {
+					w.shutdown(workerID, active, &goroutines)
+					return nil
+				}
+				continue
+			}
+
+			registrationNeeded = false
+			acquirePaused = false
+			registrationEpoch++
+
+			retryStarts := make([]attemptKey, 0)
+			for key, state := range active {
+				if state.startRetryPending && !state.startInFlight {
+					state.startRetryPending = false
+					retryStarts = append(retryStarts, key)
+				}
+				if state.executePending {
+					state.executePending = false
+					state.phase = attemptExecuting
+					executeAttempt(state.lease, key, state.ctx)
+				}
+				if state.completionRetryPending {
+					state.completionRetryPending = false
+					state.phase = attemptReadyToComplete
+					queueCompletion(key, state)
+				}
+			}
+			startAttempts(retryStarts)
+			startHeartbeat()
+			if deferredAcquire != nil {
+				pending := *deferredAcquire
+				deferredAcquire = nil
+				processAcquired(pending)
+			}
+			startAcquire()
+
 		case <-completionTimerChannel:
 			completionTimer = nil
 			completionTimerChannel = nil
 			flushCompletions()
 
 		case <-ticker.C():
+			if registrationNeeded {
+				startRegistration()
+				continue
+			}
 			acquirePaused = false
 			startHeartbeat()
 			startAcquire()
@@ -581,17 +736,22 @@ type attemptKey struct {
 }
 
 type attemptState struct {
-	lease              domain.Lease
-	ctx                context.Context
-	cancel             context.CancelFunc
-	phase              attemptPhase
-	result             executor.Result
-	completionAttempts int
+	lease                  domain.Lease
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	phase                  attemptPhase
+	result                 executor.Result
+	completionAttempts     int
+	startInFlight          bool
+	startRetryPending      bool
+	executePending         bool
+	completionRetryPending bool
 }
 
 type acquireResult struct {
 	response api.AcquireLeasesResponse
 	err      error
+	epoch    uint64
 }
 
 type attemptEvent struct {
@@ -600,17 +760,24 @@ type attemptEvent struct {
 	startErr error
 	started  bool
 	executed bool
+	epoch    uint64
 }
 
 type completionEvent struct {
-	keys []attemptKey
-	errs []error
+	keys  []attemptKey
+	errs  []error
+	epoch uint64
 }
 
 type heartbeatEvent struct {
 	requested []domain.LeaseRef
 	response  api.HeartbeatResponse
 	err       error
+	epoch     uint64
+}
+
+type registrationEvent struct {
+	err error
 }
 
 func keyFor(lease domain.Lease) attemptKey {

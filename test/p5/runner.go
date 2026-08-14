@@ -15,8 +15,13 @@ const (
 	stateSucceeded  = "SUCCEEDED"
 	stateDeadLetter = "DEAD_LETTER"
 
-	queueStalledAlert = "RailYardQueueStalled"
-	recoverySLOAlert  = "RailYardRecoverySLOBreach"
+	readyStartSLOAlert = "RailYardReadyStartSLOBreach"
+	dlqDepthHighAlert  = "RailYardDLQDepthHigh"
+
+	readyStartBreachJobs   = 20
+	readyStartRecoveryJobs = 2400
+	readyStartBatchSize    = 100
+	dlqDepthBreachJobs     = 10
 )
 
 type Config struct {
@@ -33,7 +38,8 @@ type Config struct {
 	AlertFireTimeout  time.Duration
 	AlertClearTimeout time.Duration
 	RecoveryHold      time.Duration
-	SkipLiveAlerts    bool
+	ReadyBreachHold   time.Duration
+	SLORuleEvidence   string
 }
 
 func DefaultConfig() Config {
@@ -48,9 +54,11 @@ func DefaultConfig() Config {
 		RequestTimeout:    15 * time.Second,
 		PollInterval:      250 * time.Millisecond,
 		OperationTimeout:  2 * time.Minute,
-		AlertFireTimeout:  8 * time.Minute,
-		AlertClearTimeout: 12 * time.Minute,
+		AlertFireTimeout:  12 * time.Minute,
+		AlertClearTimeout: 3 * time.Minute,
 		RecoveryHold:      9 * time.Second,
+		ReadyBreachHold:   6 * time.Second,
+		SLORuleEvidence:   "slo-summary.json",
 	}
 }
 
@@ -69,6 +77,9 @@ type Report struct {
 	QueueAlertFiredAt        time.Time     `json:"queue_alert_fired_at"`
 	QueueAlertRecoveredAt    time.Time     `json:"queue_alert_recovered_at"`
 	AuditEventCount          int           `json:"audit_event_count"`
+	LiveAlertWaitsSkipped    bool          `json:"live_alert_waits_skipped"`
+	SLORuleEvidence          string        `json:"slo_rule_evidence"`
+	Passed                   bool          `json:"passed"`
 }
 
 type Runner struct {
@@ -87,8 +98,12 @@ func NewRunner(config Config, logf func(string, ...any)) (*Runner, error) {
 		config.OperationTimeout <= 0 ||
 		config.AlertFireTimeout <= 0 ||
 		config.AlertClearTimeout <= 0 ||
-		config.RecoveryHold <= 0 {
+		config.RecoveryHold <= 0 ||
+		config.ReadyBreachHold <= 0 {
 		return nil, fmt.Errorf("all walkthrough durations must be positive")
+	}
+	if config.SLORuleEvidence == "" {
+		return nil, fmt.Errorf("SLO rule evidence path is required")
 	}
 	client, err := NewClient(
 		config.BaseURL,
@@ -116,9 +131,10 @@ func NewRunner(config Config, logf func(string, ...any)) (*Runner, error) {
 
 func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	report = Report{
-		RunID:     r.config.RunID,
-		Actor:     r.config.Actor,
-		StartedAt: time.Now().UTC(),
+		RunID:           r.config.RunID,
+		Actor:           r.config.Actor,
+		StartedAt:       time.Now().UTC(),
+		SLORuleEvidence: r.config.SLORuleEvidence,
 	}
 	defer func() {
 		restoreContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -132,8 +148,25 @@ func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	if err := r.client.Ready(ctx); err != nil {
 		return report, fmt.Errorf("rail yard readiness preflight: %w", err)
 	}
-	if _, err := r.client.AlertState(ctx, queueStalledAlert); err != nil {
-		return report, fmt.Errorf("prometheus alerts preflight: %w", err)
+	alertRules, err := r.client.AlertRules(ctx)
+	if err != nil {
+		return report, fmt.Errorf("prometheus alert rules preflight: %w", err)
+	}
+	for _, alertName := range []string{readyStartSLOAlert, dlqDepthHighAlert} {
+		if !alertRules[alertName] {
+			return report, fmt.Errorf("prometheus did not load required alert %s", alertName)
+		}
+		state, stateErr := r.client.AlertState(ctx, alertName)
+		if stateErr != nil {
+			return report, fmt.Errorf("read initial state for %s: %w", alertName, stateErr)
+		}
+		if state != "inactive" {
+			return report, fmt.Errorf(
+				"required alert %s starts in %s state, want inactive",
+				alertName,
+				state,
+			)
+		}
 	}
 	if _, err := r.client.Workers(ctx); err != nil {
 		return report, err
@@ -171,20 +204,14 @@ func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	report.DeadLetterJobID = deadLetterID
 	report.RedrivenJobID = redrivenID
 
-	if !r.config.SkipLiveAlerts {
-		r.logf("alerts: verify recovery SLO firing and recovery")
-		report.RecoveryAlertFiredAt, report.RecoveryAlertRecoveredAt, err =
-			r.verifyAlertLifecycle(ctx, recoverySLOAlert, "reassignment")
-		if err != nil {
-			return report, err
-		}
-
-		r.logf("alerts: create and recover a stalled queue")
-		report.QueueAlertFiredAt, report.QueueAlertRecoveredAt, err =
-			r.exerciseQueueStalledAlert(ctx)
-		if err != nil {
-			return report, err
-		}
+	r.logf("alerts: exercise ready-start and DLQ breach lifecycles")
+	report.RecoveryAlertFiredAt,
+		report.RecoveryAlertRecoveredAt,
+		report.QueueAlertFiredAt,
+		report.QueueAlertRecoveredAt,
+		err = r.exerciseSLOAlerts(ctx)
+	if err != nil {
+		return report, err
 	}
 
 	auditEvents, err := r.verifyAudit(ctx, report.StartedAt)
@@ -193,6 +220,7 @@ func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	}
 	report.AuditEventCount = auditEvents
 	report.CompletedAt = time.Now().UTC()
+	report.Passed = true
 	return report, nil
 }
 
@@ -398,102 +426,288 @@ func (r *Runner) exerciseDeadLetter(ctx context.Context) (string, string, error)
 	return response.Job.ID, redriven.Job.ID, nil
 }
 
-func (r *Runner) verifyAlertLifecycle(
+func (r *Runner) exerciseSLOAlerts(
 	ctx context.Context,
-	alertName string,
-	targetID string,
-) (time.Time, time.Time, error) {
-	if _, err := r.client.RecordOperatorAction(
+) (time.Time, time.Time, time.Time, time.Time, error) {
+	if err := r.compose.StopAllWorkers(ctx); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("stop workers for SLO alerts: %w", err)
+	}
+
+	dlqJobIDs, err := r.createDLQBreach(ctx)
+	if err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+	if err := r.recordAlertAction(ctx, "start", dlqDepthHighAlert, map[string]string{
+		"unredriven_entries": fmt.Sprint(dlqDepthBreachJobs),
+	}); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+
+	readyJobIDs, err := r.submitIndependentJobs(
 		ctx,
-		r.nextKey("alert-start"),
-		OperatorActionRequest{
-			Action:     "alert.exercise.start",
-			TargetType: "prometheus_alert",
-			TargetID:   alertName,
-			Details:    map[string]string{"trigger": targetID},
-		},
-	); err != nil {
-		return time.Time{}, time.Time{}, err
+		"ready-breach",
+		"p5-ready-start-breach",
+		readyStartBreachJobs,
+	)
+	if err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("submit ready-start breach jobs: %w", err)
 	}
-	if err := r.waitForAlert(ctx, alertName, "firing", r.config.AlertFireTimeout); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf(
-			"%s did not fire; the recovery metric must observe persisted "+
-				"worker-loss-to-successor-lease duration: %w",
-			alertName,
-			err,
-		)
+	if err := r.recordAlertAction(ctx, "start", readyStartSLOAlert, map[string]string{
+		"delayed_jobs": fmt.Sprint(readyStartBreachJobs),
+		"hold":         r.config.ReadyBreachHold.String(),
+	}); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
 	}
-	firedAt := time.Now().UTC()
-	if err := r.waitForAlert(ctx, alertName, "inactive", r.config.AlertClearTimeout); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("%s did not recover: %w", alertName, err)
+	if err := waitContext(ctx, r.config.ReadyBreachHold); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
 	}
-	recoveredAt := time.Now().UTC()
-	if _, err := r.client.RecordOperatorAction(
+	if err := r.compose.StartAllWorkers(ctx); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("start workers for ready-start observations: %w", err)
+	}
+	if err := r.waitForJobsSucceeded(ctx, readyJobIDs); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("complete ready-start breach jobs: %w", err)
+	}
+
+	if err := r.waitForAlert(
 		ctx,
-		r.nextKey("alert-recover"),
-		OperatorActionRequest{
-			Action:     "alert.exercise.recover",
-			TargetType: "prometheus_alert",
-			TargetID:   alertName,
-		},
+		readyStartSLOAlert,
+		"firing",
+		r.config.AlertFireTimeout,
 	); err != nil {
-		return time.Time{}, time.Time{}, err
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("%s did not fire: %w", readyStartSLOAlert, err)
 	}
-	return firedAt, recoveredAt, nil
+	readyFiredAt := time.Now().UTC()
+
+	if err := r.createReadyStartRecovery(ctx); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+	if err := r.waitForAlert(
+		ctx,
+		readyStartSLOAlert,
+		"inactive",
+		r.config.AlertClearTimeout,
+	); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("%s did not recover: %w", readyStartSLOAlert, err)
+	}
+	readyRecoveredAt := time.Now().UTC()
+	if err := r.recordAlertAction(ctx, "recover", readyStartSLOAlert, map[string]string{
+		"good_jobs": fmt.Sprint(readyStartRecoveryJobs),
+	}); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+
+	if err := r.waitForAlert(
+		ctx,
+		dlqDepthHighAlert,
+		"firing",
+		r.config.AlertFireTimeout,
+	); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("%s did not fire: %w", dlqDepthHighAlert, err)
+	}
+	dlqFiredAt := time.Now().UTC()
+	if err := r.redriveDLQBreach(ctx, dlqJobIDs); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+	if err := r.waitForAlert(
+		ctx,
+		dlqDepthHighAlert,
+		"inactive",
+		r.config.AlertClearTimeout,
+	); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{},
+			fmt.Errorf("%s did not recover: %w", dlqDepthHighAlert, err)
+	}
+	dlqRecoveredAt := time.Now().UTC()
+	if err := r.recordAlertAction(ctx, "recover", dlqDepthHighAlert, nil); err != nil {
+		return time.Time{}, time.Time{}, time.Time{}, time.Time{}, err
+	}
+	return readyFiredAt, readyRecoveredAt, dlqFiredAt, dlqRecoveredAt, nil
 }
 
-func (r *Runner) exerciseQueueStalledAlert(
-	ctx context.Context,
-) (time.Time, time.Time, error) {
-	if err := r.compose.StopAllWorkers(ctx); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("stop workers for queue alert: %w", err)
-	}
-	if _, err := r.client.RecordOperatorAction(
-		ctx,
-		r.nextKey("queue-alert-start"),
-		OperatorActionRequest{
-			Action:     "alert.exercise.start",
-			TargetType: "prometheus_alert",
-			TargetID:   queueStalledAlert,
-			Details:    map[string]string{"trigger": "worker_pool_stopped"},
-		},
-	); err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-	response, err := r.client.SubmitJob(ctx, r.nextKey("stalled-job"), SubmitJobRequest{
-		Job: r.noopJob("p5-stalled-queue", 0, nil, 3),
-	})
+func (r *Runner) createDLQBreach(ctx context.Context) ([]string, error) {
+	current, err := r.client.ListDeadLetters(ctx)
 	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("submit stalled queue job: %w", err)
+		return nil, err
 	}
-	if err := r.waitForAlert(ctx, queueStalledAlert, "firing", r.config.AlertFireTimeout); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("%s did not fire: %w", queueStalledAlert, err)
+	if len(current.DeadLetters) != 0 {
+		return nil, fmt.Errorf(
+			"DLQ alert drill requires zero current dead letters, found %d",
+			len(current.DeadLetters),
+		)
 	}
-	firedAt := time.Now().UTC()
-	if err := r.compose.Start(ctx, "worker-1"); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("restore worker for queue alert: %w", err)
+	jobIDs := make([]string, 0, dlqDepthBreachJobs)
+	for index := 0; index < dlqDepthBreachJobs; index++ {
+		response, submitErr := r.client.SubmitJob(
+			ctx,
+			r.nextKey("dlq-breach-job"),
+			SubmitJobRequest{
+				Job: r.noopJob(fmt.Sprintf("p5-dlq-breach-%02d", index), 0, nil, 3),
+			},
+		)
+		if submitErr != nil {
+			return nil, fmt.Errorf("submit DLQ breach job %d: %w", index, submitErr)
+		}
+		receipt, forceErr := r.client.ForceDeadLetter(
+			ctx,
+			r.nextKey("dlq-breach-force"),
+			response.Job.ID,
+			"P5 DLQ depth alert drill",
+		)
+		if forceErr != nil {
+			return nil, fmt.Errorf("force DLQ breach job %d: %w", index, forceErr)
+		}
+		if receipt.State != stateDeadLetter || receipt.Duplicate {
+			return nil, fmt.Errorf("invalid DLQ breach receipt for job %s", response.Job.ID)
+		}
+		jobIDs = append(jobIDs, response.Job.ID)
 	}
-	if err := r.waitForJob(ctx, response.Job.ID, r.config.OperationTimeout, func(job Job) bool {
-		return job.State == stateSucceeded
-	}); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("drain stalled queue: %w", err)
+	current, err = r.client.ListDeadLetters(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if err := r.waitForAlert(ctx, queueStalledAlert, "inactive", r.config.AlertClearTimeout); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("%s did not recover: %w", queueStalledAlert, err)
+	if len(current.DeadLetters) != dlqDepthBreachJobs {
+		return nil, fmt.Errorf(
+			"current DLQ depth = %d, want %d",
+			len(current.DeadLetters),
+			dlqDepthBreachJobs,
+		)
 	}
-	recoveredAt := time.Now().UTC()
-	if _, err := r.client.RecordOperatorAction(
+	return jobIDs, nil
+}
+
+func (r *Runner) createReadyStartRecovery(ctx context.Context) error {
+	remaining := readyStartRecoveryJobs
+	for batch := 0; remaining > 0; batch++ {
+		count := min(remaining, readyStartBatchSize)
+		jobIDs, err := r.submitIndependentJobs(
+			ctx,
+			fmt.Sprintf("ready-recovery-%02d", batch),
+			fmt.Sprintf("p5-ready-start-recovery-%02d", batch),
+			count,
+		)
+		if err != nil {
+			return fmt.Errorf("submit ready-start recovery batch %d: %w", batch, err)
+		}
+		if err := r.waitForJobsSucceeded(ctx, jobIDs); err != nil {
+			return fmt.Errorf("complete ready-start recovery batch %d: %w", batch, err)
+		}
+		remaining -= count
+	}
+	return nil
+}
+
+func (r *Runner) redriveDLQBreach(ctx context.Context, jobIDs []string) error {
+	redrivenIDs := make([]string, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		response, err := r.client.Redrive(ctx, r.nextKey("dlq-breach-redrive"), jobID)
+		if err != nil {
+			return fmt.Errorf("redrive DLQ breach job %s: %w", jobID, err)
+		}
+		if response.Duplicate || response.Job.ID == "" || response.Job.ID == jobID {
+			return fmt.Errorf("invalid redrive response for DLQ breach job %s", jobID)
+		}
+		redrivenIDs = append(redrivenIDs, response.Job.ID)
+	}
+	if err := r.waitForJobsSucceeded(ctx, redrivenIDs); err != nil {
+		return fmt.Errorf("complete redriven DLQ breach jobs: %w", err)
+	}
+	current, err := r.client.ListDeadLetters(ctx)
+	if err != nil {
+		return err
+	}
+	if len(current.DeadLetters) != 0 {
+		return fmt.Errorf("current DLQ depth after redrive = %d, want 0", len(current.DeadLetters))
+	}
+	return nil
+}
+
+func (r *Runner) recordAlertAction(
+	ctx context.Context,
+	phase string,
+	alertName string,
+	details map[string]string,
+) error {
+	_, err := r.client.RecordOperatorAction(
 		ctx,
-		r.nextKey("queue-alert-recover"),
+		r.nextKey("alert-"+phase),
 		OperatorActionRequest{
-			Action:     "alert.exercise.recover",
+			Action:     "alert.exercise." + phase,
 			TargetType: "prometheus_alert",
-			TargetID:   queueStalledAlert,
+			TargetID:   alertName,
+			Details:    details,
 		},
-	); err != nil {
-		return time.Time{}, time.Time{}, err
+	)
+	return err
+}
+
+func (r *Runner) submitIndependentJobs(
+	ctx context.Context,
+	key string,
+	namePrefix string,
+	count int,
+) ([]string, error) {
+	nodes := make([]WorkflowNode, count)
+	for index := range nodes {
+		nodes[index] = WorkflowNode{
+			Key: fmt.Sprintf("%04d", index),
+			Job: r.noopJob(
+				fmt.Sprintf("%s-%04d", namePrefix, index),
+				0,
+				nil,
+				3,
+			),
+		}
 	}
-	return firedAt, recoveredAt, nil
+	response, err := r.client.SubmitWorkflow(
+		ctx,
+		r.nextKey(key),
+		WorkflowRequest{TenantID: "p5", Nodes: nodes},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if response.Duplicate || len(response.Jobs) != count {
+		return nil, fmt.Errorf(
+			"workflow returned duplicate=%t jobs=%d, want false and %d",
+			response.Duplicate,
+			len(response.Jobs),
+			count,
+		)
+	}
+	jobIDs := make([]string, count)
+	for index, job := range response.Jobs {
+		if job.ID == "" {
+			return nil, fmt.Errorf("workflow job %d has an empty ID", index)
+		}
+		jobIDs[index] = job.ID
+	}
+	return jobIDs, nil
+}
+
+func (r *Runner) waitForJobsSucceeded(ctx context.Context, jobIDs []string) error {
+	return r.wait(ctx, r.config.OperationTimeout, "job batch completion", func(ctx context.Context) (bool, error) {
+		complete := 0
+		for _, jobID := range jobIDs {
+			job, err := r.client.GetJob(ctx, jobID)
+			if err != nil {
+				return false, err
+			}
+			if terminalState(job.State) && job.State != stateSucceeded {
+				return false, fmt.Errorf("job %s ended as %s", jobID, job.State)
+			}
+			if job.State == stateSucceeded {
+				complete++
+			}
+		}
+		return complete == len(jobIDs), nil
+	})
 }
 
 func (r *Runner) verifyAudit(ctx context.Context, since time.Time) (int, error) {
@@ -501,18 +715,7 @@ func (r *Runner) verifyAudit(ctx context.Context, since time.Time) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	requiredCounts := map[string]int{
-		"dag.submit":            1,
-		"job.submit":            2,
-		"worker.kill":           1,
-		"job.force.dead_letter": 1,
-		"dead_letter.redrive":   1,
-	}
-	if !r.config.SkipLiveAlerts {
-		requiredCounts["job.submit"] = 3
-		requiredCounts["alert.exercise.start"] = 2
-		requiredCounts["alert.exercise.recover"] = 2
-	}
+	requiredCounts := requiredAuditCounts()
 	actualCounts := make(map[string]int)
 	now := time.Now().UTC().Add(r.config.RequestTimeout)
 	for _, event := range response.Events {
@@ -537,6 +740,18 @@ func (r *Runner) verifyAudit(ctx context.Context, since time.Time) (int, error) 
 		}
 	}
 	return len(response.Events), nil
+}
+
+func requiredAuditCounts() map[string]int {
+	return map[string]int{
+		"dag.submit":             2 + readyStartRecoveryJobs/readyStartBatchSize,
+		"job.submit":             2 + dlqDepthBreachJobs,
+		"worker.kill":            1,
+		"job.force.dead_letter":  1 + dlqDepthBreachJobs,
+		"dead_letter.redrive":    1 + dlqDepthBreachJobs,
+		"alert.exercise.start":   2,
+		"alert.exercise.recover": 2,
+	}
 }
 
 func (r *Runner) waitForJob(

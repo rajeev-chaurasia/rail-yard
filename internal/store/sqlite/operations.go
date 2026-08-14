@@ -14,9 +14,11 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/dashboard"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/operations"
+	storepkg "github.com/rajeev-chaurasia/rail-yard/internal/store"
 )
 
 type ControlAction struct {
+	TenantID       string
 	IdempotencyKey string
 	Action         string
 	Actor          string
@@ -31,15 +33,7 @@ type ControlAction struct {
 	Details        map[string]string
 }
 
-type AuditEvent struct {
-	ID         string            `json:"id"`
-	Action     string            `json:"action"`
-	Actor      string            `json:"actor"`
-	OccurredAt time.Time         `json:"occurred_at"`
-	TargetType string            `json:"target_type"`
-	TargetID   string            `json:"target_id"`
-	Details    map[string]string `json:"details,omitempty"`
-}
+type AuditEvent = operations.AuditEvent
 
 type JobControlCommand struct {
 	JobID          string
@@ -76,10 +70,326 @@ type DAGNode struct {
 	Name  string
 }
 
+func (s *Store) SubmitJobOperation(
+	ctx context.Context,
+	command operations.SubmitJobCommand,
+) (api.SubmitJobResponse, error) {
+	var response api.SubmitJobResponse
+	err := s.commitOperation(ctx, command.RequestedAt, "job submission", func(tx *sql.Tx, now time.Time) error {
+		spec := command.Request.Job.Normalize()
+		if err := validateIdempotency(command.IdempotencyKey, command.RequestDigest); err != nil {
+			return err
+		}
+		stored, duplicate, err := readControlAction(
+			ctx,
+			tx,
+			spec.TenantID,
+			command.IdempotencyKey,
+			"job.submit",
+			command.RequestDigest,
+		)
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			if err := json.Unmarshal([]byte(stored), &response); err != nil {
+				return fmt.Errorf("decode job submission response: %w", err)
+			}
+			response.Duplicate = true
+			return nil
+		}
+		if err := spec.Validate(s.maxSlotCost, s.allowShell); err != nil {
+			return fmt.Errorf("validate job: %w", err)
+		}
+		dependencies, dependenciesSucceeded, dependencyFailed, err := validateExistingDependencies(
+			ctx,
+			tx,
+			spec.TenantID,
+			spec.DependsOn,
+		)
+		if err != nil {
+			return err
+		}
+		if err := s.ensureAdmission(ctx, tx, spec.TenantID, 1); err != nil {
+			return err
+		}
+		if err := ensureQueue(ctx, tx, spec.TenantID, spec.Queue, now); err != nil {
+			return err
+		}
+		jobID, err := domain.NewID()
+		if err != nil {
+			return err
+		}
+		availableAt := spec.AvailableAt.UTC()
+		if spec.AvailableAt.IsZero() {
+			availableAt = now
+		}
+		readySeq := int64(0)
+		if dependenciesSucceeded && !availableAt.After(now) {
+			readySeq, err = nextReadySeq(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		job := newJob(jobID, spec, availableAt, readySeq, now)
+		if dependencyFailed {
+			failure := domain.Failure{
+				Class:   "upstream_failed",
+				Message: "an upstream dependency did not succeed",
+			}
+			job.State = domain.StateDeadLetter
+			job.TerminalAt = timePointer(now)
+			job.Failure = &failure
+			job.ReadySeq = 0
+		}
+		if err := insertJob(ctx, tx, job); err != nil {
+			return err
+		}
+		for _, dependencyID := range dependencies {
+			if _, err := tx.ExecContext(
+				ctx,
+				"INSERT INTO job_dependencies (job_id, depends_on_id) VALUES (?, ?)",
+				job.ID,
+				dependencyID,
+			); err != nil {
+				return fmt.Errorf("insert job dependency: %w", err)
+			}
+		}
+		if err := appendEvent(
+			ctx,
+			tx,
+			job.ID,
+			"job_admitted",
+			job.State,
+			job.StateVersion,
+			now,
+			map[string]any{"ready_seq": job.ReadySeq, "actor": command.Actor},
+		); err != nil {
+			return err
+		}
+		if dependencyFailed {
+			encodedFailure, err := encodeOptionalFailure(job.Failure)
+			if err != nil {
+				return err
+			}
+			if err := insertCanonicalCompletion(
+				ctx,
+				tx,
+				job.ID,
+				job.State,
+				job.StateVersion,
+				0,
+				"",
+				encodedFailure,
+				now,
+			); err != nil {
+				return err
+			}
+			if err := insertDeadLetter(ctx, tx, job.ID, encodedFailure, now); err != nil {
+				return err
+			}
+		}
+		response = api.SubmitJobResponse{Job: job}
+		return insertControlAction(ctx, tx, ControlAction{
+			TenantID:       job.TenantID,
+			IdempotencyKey: command.IdempotencyKey,
+			Action:         "job.submit",
+			Actor:          command.Actor,
+			RequestDigest:  command.RequestDigest,
+			CommittedAt:    now,
+			TargetType:     "job",
+			TargetID:       job.ID,
+			TargetState:    job.State,
+			TargetVersion:  job.StateVersion,
+			Response:       response,
+			Details:        map[string]string{"tenant_id": job.TenantID, "queue": job.Queue},
+		})
+	})
+	if err != nil {
+		return api.SubmitJobResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *Store) SubmitDAGOperation(
+	ctx context.Context,
+	dagID string,
+	command operations.SubmitDAGCommand,
+) (operations.SubmitDAGResponse, error) {
+	var response operations.SubmitDAGResponse
+	err := s.commitOperation(ctx, command.RequestedAt, "DAG submission", func(tx *sql.Tx, now time.Time) error {
+		tenantID := command.Request.TenantID
+		if tenantID == "" {
+			tenantID = "default"
+		}
+		if err := validateIdempotency(command.IdempotencyKey, command.RequestDigest); err != nil {
+			return err
+		}
+		stored, duplicate, err := readControlAction(
+			ctx,
+			tx,
+			tenantID,
+			command.IdempotencyKey,
+			"dag.submit",
+			command.RequestDigest,
+		)
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			if err := json.Unmarshal([]byte(stored), &response); err != nil {
+				return fmt.Errorf("decode DAG submission response: %w", err)
+			}
+			response.Duplicate = true
+			return nil
+		}
+		specs, dependencyIndexes, err := validateWorkflow(
+			storepkg.WorkflowSubmission{
+				Request:        command.Request,
+				IdempotencyKey: command.IdempotencyKey,
+				RequestDigest:  command.RequestDigest,
+			},
+			tenantID,
+			s.maxSlotCost,
+			s.allowShell,
+		)
+		if err != nil {
+			return err
+		}
+		if err := s.ensureAdmission(ctx, tx, tenantID, len(specs)); err != nil {
+			return err
+		}
+		ids := make([]string, len(specs))
+		for index := range ids {
+			ids[index], err = domain.NewID()
+			if err != nil {
+				return err
+			}
+		}
+		jobs := make([]domain.Job, len(specs))
+		for index, spec := range specs {
+			if err := ensureQueue(ctx, tx, tenantID, spec.Queue, now); err != nil {
+				return err
+			}
+			availableAt := spec.AvailableAt.UTC()
+			if spec.AvailableAt.IsZero() {
+				availableAt = now
+			}
+			readySeq := int64(0)
+			if len(dependencyIndexes[index]) == 0 && !availableAt.After(now) {
+				readySeq, err = nextReadySeq(ctx, tx)
+				if err != nil {
+					return err
+				}
+			}
+			jobs[index] = newJob(ids[index], spec, availableAt, readySeq, now)
+			if err := insertJob(ctx, tx, jobs[index]); err != nil {
+				return err
+			}
+		}
+		for childIndex, parents := range dependencyIndexes {
+			for _, parentIndex := range parents {
+				if _, err := tx.ExecContext(
+					ctx,
+					"INSERT INTO job_dependencies (job_id, depends_on_id) VALUES (?, ?)",
+					ids[childIndex],
+					ids[parentIndex],
+				); err != nil {
+					return fmt.Errorf("insert workflow dependency: %w", err)
+				}
+			}
+		}
+		for _, job := range jobs {
+			if err := appendEvent(
+				ctx,
+				tx,
+				job.ID,
+				"job_admitted",
+				job.State,
+				job.StateVersion,
+				now,
+				map[string]any{"ready_seq": job.ReadySeq, "actor": command.Actor},
+			); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			`INSERT INTO dag_runs
+				(id, tenant_id, idempotency_key, request_digest, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			dagID,
+			tenantID,
+			scopedKey(tenantID, "dag.submit", command.IdempotencyKey),
+			command.RequestDigest,
+			timeToDB(now),
+			timeToDB(now),
+		); err != nil {
+			return fmt.Errorf("insert DAG: %w", err)
+		}
+		for index, job := range jobs {
+			node := command.Request.Nodes[index]
+			if _, err := tx.ExecContext(
+				ctx,
+				"INSERT INTO dag_jobs (dag_id, job_id, node_key, name) VALUES (?, ?, ?, ?)",
+				dagID,
+				job.ID,
+				node.Key,
+				node.Job.Name,
+			); err != nil {
+				return fmt.Errorf("insert DAG node: %w", err)
+			}
+		}
+		response = operations.SubmitDAGResponse{DAGID: dagID, Jobs: jobs}
+		return insertControlAction(ctx, tx, ControlAction{
+			TenantID:       tenantID,
+			IdempotencyKey: command.IdempotencyKey,
+			Action:         "dag.submit",
+			Actor:          command.Actor,
+			RequestDigest:  command.RequestDigest,
+			CommittedAt:    now,
+			TargetType:     "dag",
+			TargetID:       dagID,
+			Response:       response,
+			Details:        map[string]string{"tenant_id": tenantID},
+		})
+	})
+	if err != nil {
+		return operations.SubmitDAGResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *Store) commitOperation(
+	ctx context.Context,
+	requestedAt time.Time,
+	name string,
+	apply func(*sql.Tx, time.Time) error,
+) error {
+	releaseWrite := s.beginWrite(writeNormal)
+	defer releaseWrite()
+	now := s.writeTime(requestedAt)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", name, err)
+	}
+	defer rollback(tx)
+	if err := apply(tx, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", name, err)
+	}
+	return nil
+}
+
 func (s *Store) RecordControlAction(ctx context.Context, action ControlAction) (bool, error) {
 	releaseWrite := s.beginWrite(writeNormal)
 	defer releaseWrite()
 	action.CommittedAt = s.writeTime(action.CommittedAt)
+	if action.TenantID == "" {
+		action.TenantID = "default"
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -89,6 +399,7 @@ func (s *Store) RecordControlAction(ctx context.Context, action ControlAction) (
 	_, duplicate, err := readControlAction(
 		ctx,
 		tx,
+		action.TenantID,
 		action.IdempotencyKey,
 		action.Action,
 		action.RequestDigest,
@@ -118,6 +429,9 @@ func (s *Store) RecordOperatorAction(
 	releaseWrite := s.beginWrite(writeNormal)
 	defer releaseWrite()
 	action.CommittedAt = s.writeTime(action.CommittedAt)
+	if action.TenantID == "" {
+		action.TenantID = "default"
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -127,6 +441,7 @@ func (s *Store) RecordOperatorAction(
 	response, duplicate, err := readControlAction(
 		ctx,
 		tx,
+		action.TenantID,
 		action.IdempotencyKey,
 		action.Action,
 		action.RequestDigest,
@@ -173,9 +488,27 @@ func (s *Store) ApplyJobControl(
 		return operations.ActionReceipt{}, fmt.Errorf("begin job control: %w", err)
 	}
 	defer rollback(tx)
+
+	var state domain.JobState
+	var version int64
+	var attemptNo, slotCost int
+	var tenantID, queue string
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT state, state_version, attempt_no, slot_cost, tenant_id, queue_name
+		 FROM jobs WHERE id = ?`,
+		command.JobID,
+	).Scan(&state, &version, &attemptNo, &slotCost, &tenantID, &queue)
+	if errors.Is(err, sql.ErrNoRows) {
+		return operations.ActionReceipt{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return operations.ActionReceipt{}, fmt.Errorf("read controlled job: %w", err)
+	}
 	response, duplicate, err := readControlAction(
 		ctx,
 		tx,
+		tenantID,
 		command.IdempotencyKey,
 		command.AuditAction,
 		command.RequestDigest,
@@ -193,23 +526,6 @@ func (s *Store) ApplyJobControl(
 			return operations.ActionReceipt{}, fmt.Errorf("commit duplicate job control: %w", err)
 		}
 		return receipt, nil
-	}
-
-	var state domain.JobState
-	var version int64
-	var attemptNo, slotCost int
-	var tenantID, queue string
-	err = tx.QueryRowContext(
-		ctx,
-		`SELECT state, state_version, attempt_no, slot_cost, tenant_id, queue_name
-		 FROM jobs WHERE id = ?`,
-		command.JobID,
-	).Scan(&state, &version, &attemptNo, &slotCost, &tenantID, &queue)
-	if errors.Is(err, sql.ErrNoRows) {
-		return operations.ActionReceipt{}, domain.ErrNotFound
-	}
-	if err != nil {
-		return operations.ActionReceipt{}, fmt.Errorf("read controlled job: %w", err)
 	}
 	if state.Terminal() {
 		return operations.ActionReceipt{}, domain.ErrTerminalJob
@@ -335,6 +651,7 @@ func (s *Store) ApplyJobControl(
 		CommittedAt:  now,
 	}
 	action := ControlAction{
+		TenantID:       tenantID,
 		IdempotencyKey: command.IdempotencyKey,
 		Action:         command.AuditAction,
 		Actor:          command.Actor,
@@ -374,9 +691,28 @@ func (s *Store) RedriveDeadLetterControl(
 	}
 	defer rollback(tx)
 	const actionName = "dead_letter.redrive"
+	var redriven sql.NullString
+	if err := tx.QueryRowContext(
+		ctx,
+		"SELECT redriven_job_id FROM dead_letters WHERE job_id = ?",
+		command.JobID,
+	).Scan(&redriven); errors.Is(err, sql.ErrNoRows) {
+		return api.RedriveDeadLetterResponse{}, domain.ErrNotFound
+	} else if err != nil {
+		return api.RedriveDeadLetterResponse{}, fmt.Errorf("read controlled dead letter: %w", err)
+	}
+	original, err := scanJob(tx.QueryRowContext(
+		ctx,
+		"SELECT "+jobColumns+" FROM jobs WHERE id = ?",
+		command.JobID,
+	))
+	if err != nil {
+		return api.RedriveDeadLetterResponse{}, fmt.Errorf("read redrive source: %w", err)
+	}
 	responseJSON, duplicate, err := readControlAction(
 		ctx,
 		tx,
+		original.TenantID,
 		command.IdempotencyKey,
 		actionName,
 		command.RequestDigest,
@@ -395,27 +731,8 @@ func (s *Store) RedriveDeadLetterControl(
 		}
 		return response, nil
 	}
-
-	var redriven sql.NullString
-	if err := tx.QueryRowContext(
-		ctx,
-		"SELECT redriven_job_id FROM dead_letters WHERE job_id = ?",
-		command.JobID,
-	).Scan(&redriven); errors.Is(err, sql.ErrNoRows) {
-		return api.RedriveDeadLetterResponse{}, domain.ErrNotFound
-	} else if err != nil {
-		return api.RedriveDeadLetterResponse{}, fmt.Errorf("read controlled dead letter: %w", err)
-	}
 	if redriven.Valid {
 		return api.RedriveDeadLetterResponse{}, domain.ErrDeadLetterRedriven
-	}
-	original, err := scanJob(tx.QueryRowContext(
-		ctx,
-		"SELECT "+jobColumns+" FROM jobs WHERE id = ?",
-		command.JobID,
-	))
-	if err != nil {
-		return api.RedriveDeadLetterResponse{}, fmt.Errorf("read redrive source: %w", err)
 	}
 	created, err := cloneJob(ctx, tx, s, original, now)
 	if err != nil {
@@ -452,6 +769,7 @@ func (s *Store) RedriveDeadLetterControl(
 	}
 	response := api.RedriveDeadLetterResponse{Job: created}
 	if err := insertControlAction(ctx, tx, ControlAction{
+		TenantID:       original.TenantID,
 		IdempotencyKey: command.IdempotencyKey,
 		Action:         actionName,
 		Actor:          command.Actor,
@@ -486,9 +804,21 @@ func (s *Store) RetryJobControl(
 	}
 	defer rollback(tx)
 	const actionName = "job.retry"
+	original, err := scanJob(tx.QueryRowContext(
+		ctx,
+		"SELECT "+jobColumns+" FROM jobs WHERE id = ?",
+		command.JobID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Job{}, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("read retry source: %w", err)
+	}
 	responseJSON, duplicate, err := readControlAction(
 		ctx,
 		tx,
+		original.TenantID,
 		command.IdempotencyKey,
 		actionName,
 		command.RequestDigest,
@@ -505,17 +835,6 @@ func (s *Store) RetryJobControl(
 			return domain.Job{}, false, fmt.Errorf("commit duplicate controlled retry: %w", err)
 		}
 		return job, true, nil
-	}
-	original, err := scanJob(tx.QueryRowContext(
-		ctx,
-		"SELECT "+jobColumns+" FROM jobs WHERE id = ?",
-		command.JobID,
-	))
-	if errors.Is(err, sql.ErrNoRows) {
-		return domain.Job{}, false, domain.ErrNotFound
-	}
-	if err != nil {
-		return domain.Job{}, false, fmt.Errorf("read retry source: %w", err)
 	}
 	if !original.State.Terminal() {
 		return domain.Job{}, false, operations.ErrConflict
@@ -537,6 +856,7 @@ func (s *Store) RetryJobControl(
 		return domain.Job{}, false, err
 	}
 	if err := insertControlAction(ctx, tx, ControlAction{
+		TenantID:       original.TenantID,
 		IdempotencyKey: command.IdempotencyKey,
 		Action:         actionName,
 		Actor:          command.Actor,
@@ -806,22 +1126,30 @@ func (s *Store) WorkerHealth(
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT
-			a.worker_id,
-			MAX(a.heartbeat_at),
-			SUM(CASE WHEN a.state IN ('LEASED','RUNNING')
+			w.worker_id,
+			w.capacity_slots,
+			w.last_heartbeat_at,
+			COALESCE(SUM(CASE WHEN a.state IN ('LEASED','RUNNING')
 				AND j.state IN ('SCHEDULED','RUNNING')
 				AND j.attempt_no = a.attempt_no
-				AND j.lease_generation = a.lease_generation THEN 1 ELSE 0 END),
+				AND j.lease_generation = a.lease_generation THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN a.state IN ('LEASED','RUNNING')
 				AND j.state IN ('SCHEDULED','RUNNING')
 				AND j.attempt_no = a.attempt_no
 				AND j.lease_generation = a.lease_generation THEN j.slot_cost ELSE 0 END), 0),
-			MIN(CASE WHEN a.state IN ('LEASED','RUNNING') THEN a.leased_at END),
-			MIN(CASE WHEN a.state IN ('LEASED','RUNNING') THEN a.expires_at END)
-		 FROM attempts a
-		 JOIN jobs j ON j.id = a.job_id
-		 GROUP BY a.worker_id
-		 ORDER BY a.worker_id`,
+			MIN(CASE WHEN a.state IN ('LEASED','RUNNING')
+				AND j.state IN ('SCHEDULED','RUNNING')
+				AND j.attempt_no = a.attempt_no
+				AND j.lease_generation = a.lease_generation THEN a.leased_at END),
+			MIN(CASE WHEN a.state IN ('LEASED','RUNNING')
+				AND j.state IN ('SCHEDULED','RUNNING')
+				AND j.attempt_no = a.attempt_no
+				AND j.lease_generation = a.lease_generation THEN a.expires_at END)
+		 FROM workers w
+		 LEFT JOIN attempts a ON a.worker_id = w.worker_id
+		 LEFT JOIN jobs j ON j.id = a.job_id
+		 GROUP BY w.worker_id, w.capacity_slots, w.last_heartbeat_at
+		 ORDER BY w.worker_id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query worker health: %w", err)
@@ -836,6 +1164,7 @@ func (s *Store) WorkerHealth(
 		var oldestLease, oldestExpiry sql.NullInt64
 		if err := rows.Scan(
 			&value.WorkerID,
+			&value.CapacitySlots,
 			&heartbeat,
 			&value.ActiveLeases,
 			&value.ActiveSlots,
@@ -844,7 +1173,6 @@ func (s *Store) WorkerHealth(
 		); err != nil {
 			return nil, fmt.Errorf("scan worker health: %w", err)
 		}
-		value.CapacitySlots = max(1, value.ActiveSlots)
 		value.LastHeartbeatAt = timeFromDB(heartbeat)
 		value.HeartbeatAgeMS = max(0, now.UTC().Sub(value.LastHeartbeatAt).Milliseconds())
 		switch {
@@ -1140,7 +1468,7 @@ func (s *Store) ListAuditEvents(
 	since time.Time,
 	actor string,
 ) ([]AuditEvent, error) {
-	query := `SELECT id, action, actor, occurred_at, target_type, target_id, details_json
+	query := `SELECT id, tenant_id, action, actor, occurred_at, target_type, target_id, details_json
 		FROM audit_events WHERE occurred_at >= ?`
 	args := []any{timeToDB(since)}
 	if actor != "" {
@@ -1162,6 +1490,7 @@ func (s *Store) ListAuditEvents(
 		var detailsJSON string
 		if err := rows.Scan(
 			&value.ID,
+			&value.TenantID,
 			&value.Action,
 			&value.Actor,
 			&occurredAt,
@@ -1186,22 +1515,25 @@ func (s *Store) ListAuditEvents(
 func readControlAction(
 	ctx context.Context,
 	tx *sql.Tx,
-	key, action, digest string,
+	tenantID, key, action, digest string,
 ) (string, bool, error) {
-	var storedAction, storedDigest, response string
+	var storedDigest, response string
 	err := tx.QueryRowContext(
 		ctx,
-		`SELECT action, request_digest, response_json
-		 FROM operation_requests WHERE idempotency_key = ?`,
+		`SELECT request_digest, response_json
+		 FROM operation_requests
+		 WHERE tenant_id = ? AND action = ? AND idempotency_key = ?`,
+		tenantID,
+		action,
 		key,
-	).Scan(&storedAction, &storedDigest, &response)
+	).Scan(&storedDigest, &response)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("read control idempotency: %w", err)
 	}
-	if storedAction != action || storedDigest != digest {
+	if storedDigest != digest {
 		return "", false, domain.ErrIdempotencyConflict
 	}
 	return response, true, nil
@@ -1236,9 +1568,10 @@ func insertControlActionWithEvent(
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO operation_requests (
-			idempotency_key, action, actor, reason, request_digest, committed_at,
+			tenant_id, idempotency_key, action, actor, reason, request_digest, committed_at,
 			target_type, target_id, target_state, target_version, response_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		action.TenantID,
 		action.IdempotencyKey,
 		action.Action,
 		action.Actor,
@@ -1256,10 +1589,11 @@ func insertControlActionWithEvent(
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO audit_events (
-			id, idempotency_key, action, actor, occurred_at,
+			id, tenant_id, idempotency_key, action, actor, occurred_at,
 			target_type, target_id, details_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
+		action.TenantID,
 		action.IdempotencyKey,
 		event.Action,
 		event.Actor,
@@ -1274,9 +1608,12 @@ func insertControlActionWithEvent(
 }
 
 func newAuditEvent(action ControlAction) AuditEvent {
-	sum := sha256.Sum256([]byte(action.IdempotencyKey + "\x00" + action.Action))
+	sum := sha256.Sum256([]byte(
+		action.TenantID + "\x00" + action.Action + "\x00" + action.IdempotencyKey,
+	))
 	return AuditEvent{
 		ID:         "audit-" + hex.EncodeToString(sum[:12]),
+		TenantID:   action.TenantID,
 		Action:     action.Action,
 		Actor:      action.Actor,
 		OccurredAt: action.CommittedAt.UTC(),
@@ -1284,6 +1621,11 @@ func newAuditEvent(action ControlAction) AuditEvent {
 		TargetID:   action.TargetID,
 		Details:    action.Details,
 	}
+}
+
+func scopedKey(tenantID, action, key string) string {
+	sum := sha256.Sum256([]byte(tenantID + "\x00" + action + "\x00" + key))
+	return hex.EncodeToString(sum[:])
 }
 
 func failureJSON(action, reason string) string {

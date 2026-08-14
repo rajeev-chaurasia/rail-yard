@@ -349,7 +349,10 @@ func decodeHTTPResponse(method string, path string, response *http.Response, des
 	}
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return parseAPIError(response, body)
+		apiErr := parseAPIError(response, body)
+		apiErr.Method = method
+		apiErr.Path = path
+		return apiErr
 	}
 	if destination == nil || len(bytes.TrimSpace(body)) == 0 {
 		return nil
@@ -365,6 +368,8 @@ type APIError struct {
 	Code       string
 	Message    string
 	RetryAfter time.Duration
+	Method     string
+	Path       string
 }
 
 func (e *APIError) Error() string {
@@ -391,7 +396,7 @@ func (e *APIError) Is(target error) bool {
 	}
 }
 
-func parseAPIError(response *http.Response, body []byte) error {
+func parseAPIError(response *http.Response, body []byte) *APIError {
 	var payload api.ErrorResponse
 	if len(bytes.TrimSpace(body)) > 0 {
 		_ = json.Unmarshal(body, &payload)
@@ -420,8 +425,21 @@ func parseAPIError(response *http.Response, body []byte) error {
 func batchRouteUnavailable(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) &&
+		!workerRegistrationMissing(err) &&
 		(apiErr.StatusCode == http.StatusNotFound ||
 			apiErr.StatusCode == http.StatusMethodNotAllowed)
+}
+
+func workerRegistrationMissing(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) ||
+		apiErr.StatusCode != http.StatusNotFound ||
+		apiErr.Code != "not_found" ||
+		apiErr.Message != "worker is not registered" {
+		return false
+	}
+	return strings.HasPrefix(apiErr.Path, "/v1/workers/") &&
+		apiErr.Path != "/v1/workers/register"
 }
 
 func apiErrorResponse(err error) (*api.ErrorResponse, bool) {

@@ -61,9 +61,13 @@ jobs:
       - x64
       - rail-yard-qualification
     timeout-minutes: 360
+    env:
+      CHAOS_OUTPUT: artifacts/qualification/chaos-${{ github.run_id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          clean: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -76,8 +80,9 @@ jobs:
         env:
           CHAOS_SEED: ${{ inputs.seed }}
         run: >-
-          go run ./hack/ci compose-chaos
-          --project-prefix=rail-yard-qualification-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          go run -mod=readonly ./test/chaos
+          --resume
+          --project-prefix=rail-yard-qualification-chaos-${{ github.run_id }}
           --runs=10
           --jobs=50000
           --worker-kills=20
@@ -85,14 +90,14 @@ jobs:
           --action-min=100ms
           --action-max=500ms
           --seed="$CHAOS_SEED"
-          --output=artifacts/qualification/chaos
+          --output="$CHAOS_OUTPUT"
 
       - name: Upload chaos evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: qualification-chaos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/qualification/chaos/
+          path: ${{ env.CHAOS_OUTPUT }}/
           if-no-files-found: error
           retention-days: 30
 
@@ -106,9 +111,13 @@ jobs:
       - x64
       - rail-yard-qualification
     timeout-minutes: 240
+    env:
+      BENCHMARK_OUTPUT: artifacts/qualification/benchmark-${{ github.run_id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          clean: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -118,21 +127,26 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run qualification benchmark
-        run: >-
-          go run ./hack/ci compose-benchmark
-          --project-prefix=rail-yard-qualification-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          --runs=3
-          --jobs=50000
-          --workers=8
-          --worker-slots=256
-          --output=artifacts/qualification/benchmark
+        run: |
+          resume_args=()
+          if [[ -f "$BENCHMARK_OUTPUT/orchestration-checkpoint.json" ]]; then
+            resume_args+=(--resume)
+          fi
+          go run -mod=readonly ./test/benchmark \
+            "${resume_args[@]}" \
+            --project-prefix=rail-yard-qualification-benchmark-${{ github.run_id }} \
+            --runs=3 \
+            --jobs=50000 \
+            --workers=8 \
+            --worker-slots=256 \
+            --output="$BENCHMARK_OUTPUT"
 
       - name: Upload benchmark evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: qualification-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/qualification/benchmark/
+          path: ${{ env.BENCHMARK_OUTPUT }}/
           if-no-files-found: error
           retention-days: 30
 
@@ -178,8 +192,9 @@ jobs:
           --run-id=${{ github.run_id }}-${{ github.run_attempt }}
           --compose-file=deploy/compose.yaml
           --compose-project="$COMPOSE_PROJECT"
-          --skip-live-alerts
+          --slo-rule-evidence=slo-summary.json
           --output=artifacts/qualification/p5/walkthrough.json
+          --timeout=35m
 
       - name: Stop P5 stack
         if: ${{ always() }}

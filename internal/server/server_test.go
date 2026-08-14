@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/api"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/store"
+	sqlitestore "github.com/rajeev-chaurasia/rail-yard/internal/store/sqlite"
 )
 
 var testNow = time.Date(2026, time.August, 14, 7, 30, 0, 0, time.UTC)
@@ -291,6 +293,216 @@ func TestWorkerRoutes(t *testing.T) {
 			heartbeated,
 			completed,
 		)
+	}
+}
+
+func TestEmptyHeartbeatRefreshesIdleWorker(t *testing.T) {
+	var registered, refreshed, heartbeated bool
+	jobStore := &fakeStore{
+		registerWorker: func(
+			_ context.Context,
+			workerID string,
+			capacitySlots int,
+			now time.Time,
+		) error {
+			registered = workerID == "worker-idle" && capacitySlots == 4 && now.Equal(testNow)
+			return nil
+		},
+		heartbeatWorker: func(
+			_ context.Context,
+			workerID string,
+			now time.Time,
+		) error {
+			refreshed = workerID == "worker-idle" && now.Equal(testNow)
+			return nil
+		},
+		heartbeat: func(
+			_ context.Context,
+			workerID string,
+			refs []domain.LeaseRef,
+			now time.Time,
+			_ time.Duration,
+		) ([]api.HeartbeatResult, error) {
+			heartbeated = workerID == "worker-idle" && len(refs) == 0 && now.Equal(testNow)
+			return nil, nil
+		},
+	}
+	server := newTestServer(t, jobStore, nil)
+
+	register := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-idle","slots":4}`,
+		"",
+	)
+	if register.Code != http.StatusOK {
+		t.Fatalf("register status = %d; body = %s", register.Code, register.Body.String())
+	}
+	response := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/workers/worker-idle/heartbeats",
+		`{"leases":[]}`,
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d; body = %s", response.Code, response.Body.String())
+	}
+	var payload api.HeartbeatResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Results == nil || len(payload.Results) != 0 {
+		t.Fatalf("heartbeat results = %#v, want empty array", payload.Results)
+	}
+	if !registered || !refreshed || !heartbeated {
+		t.Fatalf(
+			"worker calls: registered=%t refreshed=%t heartbeated=%t",
+			registered,
+			refreshed,
+			heartbeated,
+		)
+	}
+}
+
+func TestWorkerRegistrationCapacityConflict(t *testing.T) {
+	var capacity int
+	jobStore := &fakeStore{
+		registerWorker: func(
+			_ context.Context,
+			_ string,
+			requested int,
+			_ time.Time,
+		) error {
+			if capacity == 0 {
+				capacity = requested
+				return nil
+			}
+			if capacity != requested {
+				return store.ErrWorkerCapacityConflict
+			}
+			return nil
+		},
+	}
+	server := newTestServer(t, jobStore, nil)
+
+	first := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-1","slots":2}`,
+		"",
+	)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first registration status = %d; body = %s", first.Code, first.Body.String())
+	}
+	duplicate := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-1","slots":2}`,
+		"",
+	)
+	if duplicate.Code != http.StatusOK {
+		t.Fatalf("duplicate registration status = %d; body = %s", duplicate.Code, duplicate.Body.String())
+	}
+	conflict := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-1","slots":3}`,
+		"",
+	)
+	assertErrorResponse(t, conflict, http.StatusConflict, "worker_conflict")
+}
+
+func TestServerRestartKeepsDurableWorkerHealthAndRequiresReregistration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server-restart.db")
+	config := DefaultConfig()
+	config.Now = func() time.Time { return testNow }
+	config.ReaperInterval = time.Hour
+	config.DuePromotionInterval = time.Hour
+	config.BackgroundOperationTimeout = time.Second
+
+	firstStore, err := sqlitestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := New(firstStore, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := performRequest(
+		first,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-restart","slots":3}`,
+		"",
+	)
+	if register.Code != http.StatusOK {
+		t.Fatalf("register status = %d; body = %s", register.Code, register.Body.String())
+	}
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	if err := first.Shutdown(shutdownContext); err != nil {
+		cancelShutdown()
+		t.Fatal(err)
+	}
+	cancelShutdown()
+
+	secondStore, err := sqlitestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(secondStore, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := second.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown restarted server: %v", err)
+		}
+	})
+
+	health, err := secondStore.WorkerHealth(context.Background(), testNow.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(health) != 1 ||
+		health[0].WorkerID != "worker-restart" ||
+		health[0].CapacitySlots != 3 {
+		t.Fatalf("durable health after restart = %+v", health)
+	}
+	missing := performRequest(
+		second,
+		http.MethodPost,
+		"/v1/workers/worker-restart/heartbeats",
+		`{"leases":[]}`,
+		"",
+	)
+	assertErrorResponse(t, missing, http.StatusNotFound, "not_found")
+
+	reregister := performRequest(
+		second,
+		http.MethodPost,
+		"/v1/workers/register",
+		`{"worker_id":"worker-restart","slots":3}`,
+		"",
+	)
+	if reregister.Code != http.StatusOK {
+		t.Fatalf("re-register status = %d; body = %s", reregister.Code, reregister.Body.String())
+	}
+	heartbeat := performRequest(
+		second,
+		http.MethodPost,
+		"/v1/workers/worker-restart/heartbeats",
+		`{"leases":[]}`,
+		"",
+	)
+	if heartbeat.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d; body = %s", heartbeat.Code, heartbeat.Body.String())
 	}
 }
 

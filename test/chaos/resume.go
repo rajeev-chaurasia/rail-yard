@@ -61,6 +61,13 @@ type resumedRun struct {
 	path    string
 }
 
+type expectedRecoverySample struct {
+	lease               activeLease
+	killConfirmedHostAt time.Time
+	killConfirmedAt     time.Time
+	clockMapping        clockMapping
+}
+
 func (c config) runConfiguration() runConfiguration {
 	return runConfiguration{
 		Version:           1,
@@ -182,7 +189,7 @@ func verifyCompletedRun(
 		return runSummary{}, err
 	}
 	seed := cfg.BaseSeed + int64(run-1)
-	if manifest.Version != 2 || manifest.Run != run || manifest.Seed != seed {
+	if manifest.Version != 3 || manifest.Run != run || manifest.Seed != seed {
 		return runSummary{}, errors.New("manifest run or seed does not match")
 	}
 	if manifest.ConfigurationHash != expectedHash {
@@ -246,21 +253,49 @@ func verifyCompletedRun(
 	observedSamples := make(map[string]struct{}, len(samples))
 	for index, sample := range samples {
 		key := recoverySampleKey(sample.KillSequence, sample.JobID)
-		if _, exists := expectedSamples[key]; !exists {
+		expected, exists := expectedSamples[key]
+		if !exists {
 			return runSummary{}, fmt.Errorf("recovery sample %d has no killed lease", index+1)
 		}
 		if _, duplicate := observedSamples[key]; duplicate {
 			return runSummary{}, fmt.Errorf("recovery sample %d is duplicated", index+1)
 		}
 		observedSamples[key] = struct{}{}
+		validatedMapping, mappingErr := newClockMapping(
+			sample.ClockMapping.ServerTime,
+			sample.ClockMapping.HostLowerBound,
+			sample.ClockMapping.HostUpperBound,
+		)
+		mappedKill := sample.ClockMapping.serverTime(sample.KillConfirmedHostAt)
+		recovery := sample.SuccessorLeasedAt.Sub(sample.KillConfirmedAt)
 		if sample.Worker == "" || sample.VictimContainerID == "" ||
-			sample.KillConfirmedAt.IsZero() ||
+			sample.KillConfirmedHostAt.IsZero() || sample.KillConfirmedAt.IsZero() ||
+			sample.ClockMapping.ServerTime.IsZero() ||
+			sample.ClockMapping.HostLowerBound.IsZero() ||
+			sample.ClockMapping.HostUpperBound.IsZero() ||
+			sample.ClockMapping.HostUpperBound.Before(sample.ClockMapping.HostLowerBound) ||
+			sample.ClockMapping.Uncertainty < 0 ||
+			sample.ClockMapping.Uncertainty > maxClockMappingUncertainty ||
+			mappingErr != nil ||
+			validatedMapping.Offset != sample.ClockMapping.Offset ||
+			validatedMapping.Uncertainty != sample.ClockMapping.Uncertainty ||
+			sample.KilledAttempt != expected.lease.AttemptNo ||
+			sample.KilledGeneration != expected.lease.Generation ||
+			!sample.KillConfirmedHostAt.Equal(expected.killConfirmedHostAt) ||
+			!sample.KillConfirmedAt.Equal(expected.killConfirmedAt) ||
+			!clockMappingsEqual(sample.ClockMapping, expected.clockMapping) ||
+			!mappedKill.Equal(sample.KillConfirmedAt) ||
 			sample.SuccessorAttempt <= sample.KilledAttempt ||
 			sample.SuccessorGeneration <= sample.KilledGeneration ||
-			sample.SuccessorLeasedAt.Before(sample.KillConfirmedAt) ||
-			sample.SuccessorObservedAt.Before(sample.SuccessorLeasedAt) ||
+			!sample.SuccessorLeasedAt.After(
+				sample.KillConfirmedAt.Add(sample.ClockMapping.Uncertainty),
+			) ||
+			sample.SuccessorObservedAt.Add(
+				sample.ClockMapping.Uncertainty,
+			).Before(sample.SuccessorLeasedAt) ||
 			sample.CompletionAt.Before(sample.SuccessorLeasedAt) ||
-			sample.RecoveryMS < 0 {
+			recovery < 0 ||
+			sample.RecoveryMS != float64(recovery)/float64(time.Millisecond) {
 			return runSummary{}, fmt.Errorf("recovery sample %d is incomplete", index+1)
 		}
 		values[index] = sample.RecoveryMS
@@ -322,10 +357,10 @@ func readRecoverySamples(path string) ([]recoverySample, error) {
 	return samples, nil
 }
 
-func readActionEvidence(path string) (int, int, map[string]struct{}, error) {
+func readActionEvidence(path string) (int, int, map[string]expectedRecoverySample, error) {
 	workerKills := 0
 	serverKills := 0
-	expectedSamples := make(map[string]struct{})
+	expectedSamples := make(map[string]expectedRecoverySample)
 	err := readJSONLines(path, func(line []byte) error {
 		var event actionEvent
 		if err := decodeJSON(line, &event); err != nil {
@@ -339,8 +374,10 @@ func readActionEvidence(path string) (int, int, map[string]struct{}, error) {
 				return err
 			}
 			var details struct {
-				KillSequence int           `json:"kill_sequence"`
-				ActiveLeases []activeLease `json:"active_leases"`
+				KillSequence  int           `json:"kill_sequence"`
+				KillConfirmed time.Time     `json:"kill_confirmed_at"`
+				ClockMapping  clockMapping  `json:"clock_mapping"`
+				ActiveLeases  []activeLease `json:"active_leases"`
 			}
 			if err := json.Unmarshal(body, &details); err != nil {
 				return err
@@ -356,7 +393,12 @@ func readActionEvidence(path string) (int, int, map[string]struct{}, error) {
 				if _, duplicate := expectedSamples[key]; duplicate {
 					return fmt.Errorf("killed lease %s is duplicated", key)
 				}
-				expectedSamples[key] = struct{}{}
+				expectedSamples[key] = expectedRecoverySample{
+					lease:               lease,
+					killConfirmedHostAt: event.ObservedAt,
+					killConfirmedAt:     details.KillConfirmed,
+					clockMapping:        details.ClockMapping,
+				}
 			}
 		case "server_killed":
 			serverKills++
@@ -374,6 +416,14 @@ func readActionEvidence(path string) (int, int, map[string]struct{}, error) {
 
 func recoverySampleKey(killSequence int, jobID string) string {
 	return strconv.Itoa(killSequence) + "\x00" + jobID
+}
+
+func clockMappingsEqual(left, right clockMapping) bool {
+	return left.HostLowerBound.Equal(right.HostLowerBound) &&
+		left.HostUpperBound.Equal(right.HostUpperBound) &&
+		left.ServerTime.Equal(right.ServerTime) &&
+		left.Offset == right.Offset &&
+		left.Uncertainty == right.Uncertainty
 }
 
 func readJSONLines(path string, consume func([]byte) error) error {

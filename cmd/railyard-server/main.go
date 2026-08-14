@@ -25,6 +25,8 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/trigger"
 )
 
+const telemetryRefreshInterval = 5 * time.Second
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -52,28 +54,47 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	controlAdapter := control.New(jobStore)
-	operationsHandler, err := control.NewHandler(controlAdapter, operations.DefaultConfig())
-	if err != nil {
-		_ = jobStore.Close()
-		return fmt.Errorf("create operations handler: %w", err)
-	}
-	dashboardHandler, err := dashboard.New(controlAdapter, dashboard.Config{})
-	if err != nil {
-		_ = jobStore.Close()
-		return fmt.Errorf("create dashboard handler: %w", err)
-	}
-
 	metrics, err := telemetry.New()
 	if err != nil {
 		_ = jobStore.Close()
 		return err
 	}
 	observedStore := telemetry.ObserveStore(jobStore, metrics)
-	if err := observedStore.RefreshDLQDepth(context.Background()); err != nil {
+	backgroundContext, stopBackground := context.WithCancel(context.Background())
+	var backgroundWait sync.WaitGroup
+	defer func() {
+		stopBackground()
+		backgroundWait.Wait()
+	}()
+	collector := telemetry.NewCollector(jobStore, metrics)
+	if err := collector.Refresh(backgroundContext); err != nil {
 		_ = jobStore.Close()
-		return err
+		return fmt.Errorf("initialize telemetry: %w", err)
 	}
+	backgroundWait.Add(1)
+	go func() {
+		defer backgroundWait.Done()
+		collector.Run(backgroundContext, telemetryRefreshInterval, func(err error) {
+			log.Printf("refresh durable telemetry: %v", err)
+		})
+	}()
+
+	controlAdapter := control.New(jobStore)
+	operationsHandler, err := control.NewHandler(controlAdapter, operations.DefaultConfig())
+	if err != nil {
+		stopBackground()
+		backgroundWait.Wait()
+		_ = jobStore.Close()
+		return fmt.Errorf("create operations handler: %w", err)
+	}
+	dashboardHandler, err := dashboard.New(controlAdapter, dashboard.Config{})
+	if err != nil {
+		stopBackground()
+		backgroundWait.Wait()
+		_ = jobStore.Close()
+		return fmt.Errorf("create dashboard handler: %w", err)
+	}
+
 	handlerConfig := server.DefaultConfig()
 	handlerConfig.HeartbeatEvery = serverConfig.HeartbeatEvery
 	handlerConfig.LeaseTTL = serverConfig.LeaseTTL
@@ -86,38 +107,39 @@ func run(args []string) error {
 	}
 	app, err := server.New(observedStore, handlerConfig)
 	if err != nil {
+		stopBackground()
+		backgroundWait.Wait()
 		_ = jobStore.Close()
 		return err
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler())
-	refreshingOperations := withDLQRefresh(operationsHandler, observedStore)
-	refreshingDashboard := withDLQRefresh(dashboardHandler, observedStore)
-	mux.Handle("/v1/operations/", refreshingOperations)
-	mux.Handle("/ops", refreshingDashboard)
-	mux.Handle("/ops/", refreshingDashboard)
+	mux.Handle("/v1/operations/", operationsHandler)
+	mux.Handle("/ops", dashboardHandler)
+	mux.Handle("/ops/", dashboardHandler)
 	mux.Handle("/", app.Handler())
 
-	triggerContext, stopTriggers := context.WithCancel(context.Background())
-	defer stopTriggers()
 	triggerResult := make(chan error, 1)
-	var triggerWait sync.WaitGroup
 	var redisClient *redis.Client
 	if serverConfig.RedisURL != "" {
 		options, err := redis.ParseURL(serverConfig.RedisURL)
 		if err != nil {
+			stopBackground()
+			backgroundWait.Wait()
 			_ = app.Shutdown(context.Background())
 			return fmt.Errorf("parse Redis URL: %w", err)
 		}
 		options.ContextTimeoutEnabled = true
 		redisClient = redis.NewClient(options)
-		if err := redisClient.Ping(triggerContext).Err(); err != nil {
+		if err := redisClient.Ping(backgroundContext).Err(); err != nil {
+			stopBackground()
+			backgroundWait.Wait()
 			_ = redisClient.Close()
 			_ = app.Shutdown(context.Background())
 			return fmt.Errorf("connect to Redis: %w", err)
 		}
-		consumer, err := trigger.NewRedisConsumer(redisClient, jobStore, trigger.RedisConsumerConfig{
+		consumer, err := trigger.NewRedisConsumer(redisClient, observedStore, trigger.RedisConsumerConfig{
 			TriggerID: "default",
 			Stream:    serverConfig.RedisStream,
 			Group:     serverConfig.RedisGroup,
@@ -127,14 +149,41 @@ func run(args []string) error {
 			ClaimIdle: serverConfig.RedisClaimIdle,
 		})
 		if err != nil {
+			stopBackground()
+			backgroundWait.Wait()
 			_ = redisClient.Close()
 			_ = app.Shutdown(context.Background())
 			return err
 		}
-		triggerWait.Add(1)
+		if err := consumer.EnsureGroup(backgroundContext); err != nil {
+			stopBackground()
+			backgroundWait.Wait()
+			_ = redisClient.Close()
+			_ = app.Shutdown(context.Background())
+			return err
+		}
+		refreshRedisStreamState(
+			backgroundContext,
+			redisClient,
+			metrics,
+			serverConfig.RedisStream,
+			serverConfig.RedisGroup,
+		)
+		backgroundWait.Add(2)
 		go func() {
-			defer triggerWait.Done()
-			triggerResult <- consumer.Run(triggerContext)
+			defer backgroundWait.Done()
+			triggerResult <- consumer.Run(backgroundContext)
+		}()
+		go func() {
+			defer backgroundWait.Done()
+			collectRedisStreamState(
+				backgroundContext,
+				redisClient,
+				metrics,
+				serverConfig.RedisStream,
+				serverConfig.RedisGroup,
+				telemetryRefreshInterval,
+			)
 		}()
 	}
 
@@ -161,28 +210,62 @@ func run(args []string) error {
 	case <-signalContext.Done():
 	}
 
-	stopTriggers()
+	stopBackground()
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	var redisErr error
 	if redisClient != nil {
 		redisErr = redisClient.Close()
 	}
-	triggerWait.Wait()
+	backgroundWait.Wait()
 	appErr := app.Shutdown(shutdownContext)
 	httpErr := httpServer.Shutdown(shutdownContext)
 	return errors.Join(runErr, appErr, httpErr, redisErr)
 }
 
-type dlqRefresher interface {
-	RefreshDLQDepth(context.Context) error
+func collectRedisStreamState(
+	ctx context.Context,
+	client *redis.Client,
+	metrics *telemetry.Metrics,
+	stream string,
+	group string,
+	interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshRedisStreamState(ctx, client, metrics, stream, group)
+		}
+	}
 }
 
-func withDLQRefresh(next http.Handler, refresher dlqRefresher) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-		if err := refresher.RefreshDLQDepth(r.Context()); err != nil {
-			log.Printf("refresh DLQ depth: %v", err)
+func refreshRedisStreamState(
+	ctx context.Context,
+	client *redis.Client,
+	metrics *telemetry.Metrics,
+	stream string,
+	group string,
+) {
+	groups, err := client.XInfoGroups(ctx, stream).Result()
+	if err != nil {
+		metrics.ClearRedisStreamState()
+		if ctx.Err() == nil {
+			log.Printf("refresh Redis telemetry: %v", err)
 		}
-	})
+		return
+	}
+	for _, value := range groups {
+		if value.Name == group {
+			metrics.SetRedisStreamState(value.Lag, value.Pending)
+			return
+		}
+	}
+	metrics.ClearRedisStreamState()
+	if ctx.Err() == nil {
+		log.Printf("refresh Redis telemetry: consumer group %q not found", group)
+	}
 }

@@ -18,6 +18,8 @@ type fakeStore struct {
 		time.Time,
 	) ([]domain.Job, bool, error)
 	getJob           func(context.Context, string) (domain.Job, error)
+	registerWorker   func(context.Context, string, int, time.Time) error
+	heartbeatWorker  func(context.Context, string, time.Time) error
 	acquire          func(context.Context, string, int, int, time.Time, time.Duration) ([]domain.Lease, error)
 	markRunning      func(context.Context, string, domain.LeaseRef, time.Time) error
 	markRunningBatch func(
@@ -74,6 +76,29 @@ func (f *fakeStore) GetJob(ctx context.Context, jobID string) (domain.Job, error
 		return domain.Job{}, nil
 	}
 	return f.getJob(ctx, jobID)
+}
+
+func (f *fakeStore) RegisterWorker(
+	ctx context.Context,
+	workerID string,
+	capacitySlots int,
+	now time.Time,
+) error {
+	if f.registerWorker == nil {
+		return nil
+	}
+	return f.registerWorker(ctx, workerID, capacitySlots, now)
+}
+
+func (f *fakeStore) HeartbeatWorker(
+	ctx context.Context,
+	workerID string,
+	now time.Time,
+) error {
+	if f.heartbeatWorker == nil {
+		return nil
+	}
+	return f.heartbeatWorker(ctx, workerID, now)
 }
 
 func (f *fakeStore) Acquire(

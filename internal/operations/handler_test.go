@@ -17,16 +17,18 @@ import (
 var fixedNow = time.Date(2026, time.August, 14, 9, 0, 0, 0, time.UTC)
 
 type fakeRepository struct {
-	submitJob        func(context.Context, SubmitJobCommand) (api.SubmitJobResponse, error)
-	submitDAG        func(context.Context, SubmitDAGCommand) (SubmitDAGResponse, error)
-	getJob           func(context.Context, string) (domain.Job, error)
-	getJobHistory    func(context.Context, string, HistoryQuery) (JobHistoryPage, error)
-	cancelJob        func(context.Context, CancelJobCommand) (ActionReceipt, error)
-	redrive          func(context.Context, RedriveCommand) (api.RedriveDeadLetterResponse, error)
-	listQueueDepth   func(context.Context, string) ([]QueueDepth, error)
-	listWorkerHealth func(context.Context) ([]WorkerHealth, error)
-	getDAG           func(context.Context, string) (DAGDetail, error)
-	forceJob         func(context.Context, ForceJobCommand) (ActionReceipt, error)
+	submitJob            func(context.Context, SubmitJobCommand) (api.SubmitJobResponse, error)
+	submitDAG            func(context.Context, SubmitDAGCommand) (SubmitDAGResponse, error)
+	getJob               func(context.Context, string) (domain.Job, error)
+	getJobHistory        func(context.Context, string, HistoryQuery) (JobHistoryPage, error)
+	cancelJob            func(context.Context, CancelJobCommand) (ActionReceipt, error)
+	redrive              func(context.Context, RedriveCommand) (api.RedriveDeadLetterResponse, error)
+	listQueueDepth       func(context.Context, string) ([]QueueDepth, error)
+	listWorkerHealth     func(context.Context) ([]WorkerHealth, error)
+	getDAG               func(context.Context, string) (DAGDetail, error)
+	forceJob             func(context.Context, ForceJobCommand) (ActionReceipt, error)
+	recordOperatorAction func(context.Context, OperatorActionCommand) (OperatorActionResponse, error)
+	listAuditEvents      func(context.Context, AuditEventQuery) (AuditEventResponse, error)
 }
 
 func (f *fakeRepository) SubmitJob(
@@ -121,17 +123,39 @@ func (f *fakeRepository) ForceJobAction(
 	return f.forceJob(ctx, command)
 }
 
+func (f *fakeRepository) RecordOperatorAction(
+	ctx context.Context,
+	command OperatorActionCommand,
+) (OperatorActionResponse, error) {
+	if f.recordOperatorAction == nil {
+		return OperatorActionResponse{}, nil
+	}
+	return f.recordOperatorAction(ctx, command)
+}
+
+func (f *fakeRepository) ListAuditEvents(
+	ctx context.Context,
+	query AuditEventQuery,
+) (AuditEventResponse, error) {
+	if f.listAuditEvents == nil {
+		return AuditEventResponse{}, nil
+	}
+	return f.listAuditEvents(ctx, query)
+}
+
 func TestOperationsRoutes(t *testing.T) {
 	called := make(map[string]bool)
 	repository := &fakeRepository{
 		submitJob: func(_ context.Context, command SubmitJobCommand) (api.SubmitJobResponse, error) {
 			called["submit_job"] = command.IdempotencyKey == "key" &&
-				command.Request.Job.TenantID == "default"
+				command.Request.Job.TenantID == "default" &&
+				command.Actor == "operator-1"
 			return api.SubmitJobResponse{Job: domain.Job{ID: "job-1"}}, nil
 		},
 		submitDAG: func(_ context.Context, command SubmitDAGCommand) (SubmitDAGResponse, error) {
 			called["submit_dag"] = command.IdempotencyKey == "key" &&
-				command.Request.TenantID == "tenant-1"
+				command.Request.TenantID == "tenant-1" &&
+				command.Actor == "operator-1"
 			return SubmitDAGResponse{DAGID: "dag-1", Jobs: []domain.Job{}}, nil
 		},
 		getJob: func(_ context.Context, jobID string) (domain.Job, error) {
@@ -194,6 +218,7 @@ func TestOperationsRoutes(t *testing.T) {
 			method:     http.MethodPost,
 			path:       "/v1/operations/jobs",
 			body:       `{"job":{"payload":{"type":"noop"}}}`,
+			mutation:   true,
 			idempotent: true,
 			wantStatus: http.StatusCreated,
 		},
@@ -202,6 +227,7 @@ func TestOperationsRoutes(t *testing.T) {
 			method:     http.MethodPost,
 			path:       "/v1/operations/dags",
 			body:       `{"tenant_id":"tenant-1","nodes":[{"key":"a","job":{"payload":{"type":"noop"}}}]}`,
+			mutation:   true,
 			idempotent: true,
 			wantStatus: http.StatusCreated,
 		},
@@ -307,12 +333,40 @@ func TestOperationsRoutes(t *testing.T) {
 
 func TestOperatorMutationsRequireActorAndIdempotencyHeaders(t *testing.T) {
 	repository := &fakeRepository{
+		submitJob: func(context.Context, SubmitJobCommand) (api.SubmitJobResponse, error) {
+			t.Fatal("SubmitJob called for invalid request")
+			return api.SubmitJobResponse{}, nil
+		},
+		submitDAG: func(context.Context, SubmitDAGCommand) (SubmitDAGResponse, error) {
+			t.Fatal("SubmitDAG called for invalid request")
+			return SubmitDAGResponse{}, nil
+		},
 		cancelJob: func(context.Context, CancelJobCommand) (ActionReceipt, error) {
 			t.Fatal("CancelJob called for invalid request")
 			return ActionReceipt{}, nil
 		},
 	}
 	handler := newTestHandler(t, repository, nil)
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(
+			http.MethodPost,
+			"/v1/operations/jobs",
+			strings.NewReader(`{"job":{"payload":{"type":"noop"}}}`),
+		),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/v1/operations/dags",
+			strings.NewReader(
+				`{"tenant_id":"tenant-a","nodes":[{"key":"a","job":{"payload":{"type":"noop"}}}]}`,
+			),
+		),
+	} {
+		request.Header.Set("Idempotency-Key", "key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		assertAPIError(t, response, http.StatusBadRequest, "invalid_request")
+	}
 
 	request := httptest.NewRequest(
 		http.MethodPost,
@@ -379,6 +433,7 @@ func TestStrictBoundedJSON(t *testing.T) {
 				strings.NewReader(test.body),
 			)
 			request.Header.Set("Idempotency-Key", "key")
+			request.Header.Set(defaultActorHeader, "operator-1")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			assertAPIError(t, response, test.wantStatus, test.wantCode)
@@ -412,6 +467,7 @@ func TestSubmissionDigestUsesNormalizedRequest(t *testing.T) {
 			strings.NewReader(body),
 		)
 		request.Header.Set("Idempotency-Key", "key")
+		request.Header.Set(defaultActorHeader, "operator-1")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusCreated && response.Code != http.StatusOK {
@@ -513,16 +569,18 @@ func newTestHandler(
 
 func allRepositories(repository *fakeRepository) Repositories {
 	return Repositories{
-		JobSubmitter:       repository,
-		DAGSubmitter:       repository,
-		JobReader:          repository,
-		JobHistoryReader:   repository,
-		JobCanceller:       repository,
-		DeadLetterRedriver: repository,
-		QueueDepthReader:   repository,
-		WorkerHealthReader: repository,
-		DAGReader:          repository,
-		ForceJobController: repository,
+		JobSubmitter:           repository,
+		DAGSubmitter:           repository,
+		JobReader:              repository,
+		JobHistoryReader:       repository,
+		JobCanceller:           repository,
+		DeadLetterRedriver:     repository,
+		QueueDepthReader:       repository,
+		WorkerHealthReader:     repository,
+		DAGReader:              repository,
+		ForceJobController:     repository,
+		OperatorActionRecorder: repository,
+		AuditEventReader:       repository,
 	}
 }
 

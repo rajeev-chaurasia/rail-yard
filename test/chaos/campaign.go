@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	minimumWorkerKills = 1
-	defaultWorkerKills = 20
-	databaseService    = "server"
+	minimumWorkerKills         = 1
+	defaultWorkerKills         = 20
+	databaseService            = "server"
+	maxClockMappingUncertainty = 250 * time.Millisecond
 )
 
 var composeNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
@@ -125,28 +126,70 @@ type activeLease struct {
 }
 
 type workerKill struct {
-	Sequence    int
-	Worker      string
-	ContainerID string
-	ConfirmedAt time.Time
-	Leases      []activeLease
-	RecoveredAt map[string]time.Time
+	Sequence        int
+	Worker          string
+	ContainerID     string
+	ConfirmedHostAt time.Time
+	ConfirmedAt     time.Time
+	ClockMapping    clockMapping
+	Leases          []activeLease
+	RecoveredAt     map[string]time.Time
+}
+
+type clockMapping struct {
+	HostLowerBound time.Time     `json:"host_lower_bound"`
+	HostUpperBound time.Time     `json:"host_upper_bound"`
+	ServerTime     time.Time     `json:"server_time"`
+	Offset         time.Duration `json:"offset"`
+	Uncertainty    time.Duration `json:"uncertainty"`
+}
+
+func (m clockMapping) serverTime(hostTime time.Time) time.Time {
+	return hostTime.Add(m.Offset).UTC()
+}
+
+type clockCalibrator struct {
+	mu      sync.RWMutex
+	mapping clockMapping
+}
+
+func (c *clockCalibrator) record(mapping clockMapping) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.mapping.ServerTime.IsZero() && c.mapping.Uncertainty <= mapping.Uncertainty {
+		return
+	}
+	c.mapping = mapping
+}
+
+func (c *clockCalibrator) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mapping = clockMapping{}
+}
+
+func (c *clockCalibrator) current() (clockMapping, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.mapping, !c.mapping.ServerTime.IsZero()
 }
 
 type recoverySample struct {
-	KillSequence        int       `json:"kill_sequence"`
-	Worker              string    `json:"worker"`
-	VictimContainerID   string    `json:"victim_container_id"`
-	JobID               string    `json:"job_id"`
-	KilledAttempt       int       `json:"killed_attempt"`
-	KilledGeneration    int64     `json:"killed_generation"`
-	KillConfirmedAt     time.Time `json:"kill_confirmed_at"`
-	SuccessorAttempt    int       `json:"successor_attempt"`
-	SuccessorGeneration int64     `json:"successor_generation"`
-	SuccessorLeasedAt   time.Time `json:"successor_leased_at"`
-	SuccessorObservedAt time.Time `json:"successor_observed_at"`
-	CompletionAt        time.Time `json:"completion_at"`
-	RecoveryMS          float64   `json:"recovery_ms"`
+	KillSequence        int          `json:"kill_sequence"`
+	Worker              string       `json:"worker"`
+	VictimContainerID   string       `json:"victim_container_id"`
+	JobID               string       `json:"job_id"`
+	KilledAttempt       int          `json:"killed_attempt"`
+	KilledGeneration    int64        `json:"killed_generation"`
+	KillConfirmedHostAt time.Time    `json:"kill_confirmed_host_at"`
+	KillConfirmedAt     time.Time    `json:"kill_confirmed_at"`
+	ClockMapping        clockMapping `json:"clock_mapping"`
+	SuccessorAttempt    int          `json:"successor_attempt"`
+	SuccessorGeneration int64        `json:"successor_generation"`
+	SuccessorLeasedAt   time.Time    `json:"successor_leased_at"`
+	SuccessorObservedAt time.Time    `json:"successor_observed_at"`
+	CompletionAt        time.Time    `json:"completion_at"`
+	RecoveryMS          float64      `json:"recovery_ms"`
 }
 
 type databaseAttempt struct {
@@ -155,6 +198,14 @@ type databaseAttempt struct {
 	Generation   int64
 	LeasedAt     time.Time
 	CompletionAt time.Time
+}
+
+type leaseBoundaryState struct {
+	JobID       string
+	AttemptNo   int
+	Generation  int64
+	State       string
+	CompletedAt time.Time
 }
 
 type actionEvent struct {
@@ -343,9 +394,11 @@ func (r *receiptRecorder) record(record reconcile.AcceptedRecord) error {
 
 type submitResponse struct {
 	Job struct {
-		ID string `json:"id"`
+		ID        string    `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
 	} `json:"job"`
 	Duplicate bool `json:"duplicate"`
+	mapping   clockMapping
 }
 
 type apiError struct {
@@ -411,7 +464,9 @@ func (c submissionClient) submit(
 		request.Header.Set("Accept", "application/json")
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", key)
+		hostBefore := time.Now().UTC()
 		response, err := c.client.Do(request)
+		hostAfter := time.Now().UTC()
 		if err != nil {
 			if waitErr := wait(ctx, c.pollInterval); waitErr != nil {
 				return submitResponse{}, waitErr
@@ -433,6 +488,15 @@ func (c submissionClient) submit(
 			}
 			if result.Job.ID == "" {
 				return submitResponse{}, fmt.Errorf("submission %d response has empty job ID", index)
+			}
+			if result.Job.CreatedAt.IsZero() {
+				return submitResponse{}, fmt.Errorf("submission %d response has no durable creation time", index)
+			}
+			if !result.Duplicate {
+				result.mapping, err = newClockMapping(result.Job.CreatedAt, hostBefore, hostAfter)
+				if err != nil {
+					return submitResponse{}, fmt.Errorf("submission %d clock mapping: %w", index, err)
+				}
 			}
 			return result, nil
 		}
@@ -598,7 +662,7 @@ func runOnce(
 		return result, err
 	}
 	manifest := runManifest{
-		Version:              2,
+		Version:              3,
 		Run:                  run,
 		Seed:                 seed,
 		Project:              project,
@@ -639,6 +703,7 @@ func runOnce(
 		}
 	}()
 	var acceptedCount atomic.Int64
+	calibrator := &clockCalibrator{}
 	recorder := &receiptRecorder{
 		writer:   receipts,
 		accepted: &acceptedCount,
@@ -660,6 +725,7 @@ func runOnce(
 			targetJobs,
 			serverRestarted,
 			recorder,
+			calibrator,
 		)
 	}()
 	go func() {
@@ -673,6 +739,7 @@ func runOnce(
 			&acceptedCount,
 			events,
 			serverRestarted,
+			calibrator,
 		)
 	}()
 
@@ -817,6 +884,7 @@ func submitAll(
 	serverReleaseAt int,
 	serverRestarted <-chan struct{},
 	recorder *receiptRecorder,
+	calibrator *clockCalibrator,
 ) error {
 	client := submissionClient{
 		baseURL: strings.TrimRight(cfg.ServerURL, "/"),
@@ -848,6 +916,9 @@ func submitAll(
 				}); err != nil {
 					errorsChannel <- err
 					return
+				}
+				if !response.mapping.ServerTime.IsZero() {
+					calibrator.record(response.mapping)
 				}
 			}
 		}()
@@ -898,6 +969,7 @@ func runActions(
 	accepted *atomic.Int64,
 	events *jsonLines,
 	serverRestarted chan<- struct{},
+	calibrator *clockCalibrator,
 ) actionResult {
 	result := actionResult{kills: make([]workerKill, 0, cfg.WorkerKills)}
 	serverKilled := false
@@ -918,6 +990,7 @@ func runActions(
 				result.err = err
 				return result
 			}
+			calibrator.reset()
 			serverKilled = true
 			result.serverKills = 1
 			close(serverRestarted)
@@ -990,7 +1063,7 @@ func runActions(
 			return result
 		}
 		kill, err := killAndRestartWorker(
-			ctx, cfg, compose, events, victim, result.workerKills+1,
+			ctx, cfg, compose, events, victim, result.workerKills+1, calibrator,
 		)
 		if err != nil {
 			result.err = err
@@ -1009,26 +1082,46 @@ func killAndRestartWorker(
 	events *jsonLines,
 	worker string,
 	sequence int,
+	calibrator *clockCalibrator,
 ) (workerKill, error) {
 	containerID, err := compose.containerID(ctx, worker)
 	if err != nil {
 		return workerKill{}, fmt.Errorf("find victim container for %s: %w", worker, err)
 	}
+	mapping, err := waitForClockMapping(ctx, cfg, calibrator)
+	if err != nil {
+		return workerKill{}, fmt.Errorf("calibrate server clock before killing %s: %w", worker, err)
+	}
+	snapshot, err := readCurrentFencedLeases(ctx, compose, cfg.DatabasePath, worker)
+	if err != nil {
+		return workerKill{}, err
+	}
 	if err := compose.kill(ctx, worker); err != nil {
 		return workerKill{}, fmt.Errorf("SIGKILL worker %s: %w", worker, err)
 	}
-	confirmedAt := time.Now().UTC()
-	leases, err := readActiveLeases(ctx, compose, cfg.DatabasePath, worker, confirmedAt)
+	confirmedHostAt := time.Now().UTC()
+	confirmedAt := mapping.serverTime(confirmedHostAt)
+	leases, err := reconcileKilledLeases(
+		ctx,
+		compose,
+		cfg.DatabasePath,
+		snapshot,
+		confirmedAt,
+		mapping.Uncertainty,
+	)
 	if err != nil {
 		return workerKill{}, err
 	}
 	if err := writeEvent(events, actionEvent{
 		Type:       "worker_killed",
-		ObservedAt: confirmedAt,
+		ObservedAt: confirmedHostAt,
 		Service:    worker,
 		Details: map[string]any{
 			"kill_sequence":       sequence,
 			"victim_container_id": containerID,
+			"kill_confirmed_at":   confirmedAt,
+			"clock_mapping":       mapping,
+			"pre_kill_leases":     snapshot,
 			"active_leases":       leases,
 		},
 	}); err != nil {
@@ -1040,7 +1133,7 @@ func killAndRestartWorker(
 	if err := waitForService(ctx, cfg, compose, worker); err != nil {
 		return workerKill{}, err
 	}
-	recoveredAt, err := waitForLeaseRecovery(ctx, cfg, compose, leases)
+	recoveredAt, err := waitForLeaseRecovery(ctx, cfg, compose, leases, mapping)
 	if err != nil {
 		return workerKill{}, err
 	}
@@ -1053,12 +1146,14 @@ func killAndRestartWorker(
 		return workerKill{}, err
 	}
 	return workerKill{
-		Sequence:    sequence,
-		Worker:      worker,
-		ContainerID: containerID,
-		ConfirmedAt: confirmedAt,
-		Leases:      leases,
-		RecoveredAt: recoveredAt,
+		Sequence:        sequence,
+		Worker:          worker,
+		ContainerID:     containerID,
+		ConfirmedHostAt: confirmedHostAt,
+		ConfirmedAt:     confirmedAt,
+		ClockMapping:    mapping,
+		Leases:          leases,
+		RecoveredAt:     recoveredAt,
 	}, nil
 }
 
@@ -1256,11 +1351,55 @@ func waitForPostRestartLease(
 	return result, err
 }
 
+func newClockMapping(serverTime, hostLower, hostUpper time.Time) (clockMapping, error) {
+	if serverTime.IsZero() || hostLower.IsZero() || hostUpper.IsZero() {
+		return clockMapping{}, errors.New("clock mapping contains a zero timestamp")
+	}
+	if hostUpper.Before(hostLower) {
+		return clockMapping{}, errors.New("clock mapping host bounds are reversed")
+	}
+	uncertainty := hostUpper.Sub(hostLower) / 2
+	hostMidpoint := hostLower.Add(hostUpper.Sub(hostLower) / 2)
+	return clockMapping{
+		HostLowerBound: hostLower,
+		HostUpperBound: hostUpper,
+		ServerTime:     serverTime,
+		Offset:         serverTime.Sub(hostMidpoint),
+		Uncertainty:    uncertainty,
+	}, nil
+}
+
+func waitForClockMapping(
+	ctx context.Context,
+	cfg config,
+	calibrator *clockCalibrator,
+) (clockMapping, error) {
+	if calibrator == nil {
+		return clockMapping{}, errors.New("clock calibrator is nil")
+	}
+	deadlineContext, cancel := context.WithTimeout(ctx, cfg.StartupTimeout)
+	defer cancel()
+	var result clockMapping
+	err := poll(deadlineContext, cfg.PollInterval, func() (bool, error) {
+		mapping, exists := calibrator.current()
+		if !exists {
+			return false, nil
+		}
+		if mapping.Uncertainty < 0 || mapping.Uncertainty > maxClockMappingUncertainty {
+			return false, fmt.Errorf("persisted clock mapping uncertainty is invalid")
+		}
+		result = mapping
+		return true, nil
+	}, "durable server clock mapping")
+	return result, err
+}
+
 func waitForLeaseRecovery(
 	ctx context.Context,
 	cfg config,
 	compose composeClient,
 	leases []activeLease,
+	mapping clockMapping,
 ) (map[string]time.Time, error) {
 	recovered := make(map[string]time.Time, len(leases))
 	if len(leases) == 0 {
@@ -1285,7 +1424,7 @@ func waitForLeaseRecovery(
 		if err != nil {
 			return false, nil
 		}
-		observedAt := time.Now().UTC()
+		observedAt := mapping.serverTime(time.Now().UTC())
 		for _, jobID := range nonemptyLines(output) {
 			if _, exists := recovered[jobID]; !exists {
 				recovered[jobID] = observedAt
@@ -1339,11 +1478,10 @@ func readProgress(
 	}, nil
 }
 
-func readActiveLeases(
+func readCurrentFencedLeases(
 	ctx context.Context,
 	compose composeClient,
 	databasePath, worker string,
-	killedAt time.Time,
 ) ([]activeLease, error) {
 	query := fmt.Sprintf(`
 		SELECT a.job_id, a.attempt_no, a.lease_generation, a.leased_at
@@ -1355,10 +1493,8 @@ func readActiveLeases(
 		WHERE a.worker_id = %s
 		  AND a.state IN ('LEASED', 'RUNNING')
 		  AND j.state IN ('SCHEDULED', 'RUNNING')
-		  AND a.leased_at <= %d
 		ORDER BY a.job_id;`,
 		sqlLiteral(worker),
-		killedAt.UnixNano(),
 	)
 	output, err := compose.querySQLite(ctx, databasePath, query)
 	if err != nil {
@@ -1391,6 +1527,129 @@ func readActiveLeases(
 		})
 	}
 	return result, nil
+}
+
+func reconcileKilledLeases(
+	ctx context.Context,
+	compose composeClient,
+	databasePath string,
+	snapshot []activeLease,
+	confirmedAt time.Time,
+	uncertainty time.Duration,
+) ([]activeLease, error) {
+	if len(snapshot) == 0 {
+		return nil, nil
+	}
+	conditions := make([]string, len(snapshot))
+	for index, lease := range snapshot {
+		conditions[index] = fmt.Sprintf(
+			"(job_id = %s AND attempt_no = %d AND lease_generation = %d)",
+			sqlLiteral(lease.JobID),
+			lease.AttemptNo,
+			lease.Generation,
+		)
+	}
+	query := fmt.Sprintf(`
+		SELECT job_id, attempt_no, lease_generation, state, COALESCE(completed_at, 0)
+		FROM attempts
+		WHERE %s
+		ORDER BY job_id;`,
+		strings.Join(conditions, " OR "),
+	)
+	output, err := compose.querySQLite(ctx, databasePath, query)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile killed lease snapshot: %w", err)
+	}
+	states := make([]leaseBoundaryState, 0, len(snapshot))
+	for _, line := range nonemptyLines(output) {
+		parts := strings.Split(line, "|")
+		if len(parts) != 5 {
+			return nil, fmt.Errorf("lease boundary row has %d columns: %q", len(parts), line)
+		}
+		attemptNo, parseErr := strconv.Atoi(parts[1])
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse lease boundary attempt: %w", parseErr)
+		}
+		generation, parseErr := strconv.ParseInt(parts[2], 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse lease boundary generation: %w", parseErr)
+		}
+		completedAt, parseErr := strconv.ParseInt(parts[4], 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse lease boundary completion: %w", parseErr)
+		}
+		state := leaseBoundaryState{
+			JobID:      parts[0],
+			AttemptNo:  attemptNo,
+			Generation: generation,
+			State:      parts[3],
+		}
+		if completedAt != 0 {
+			state.CompletedAt = time.Unix(0, completedAt).UTC()
+		}
+		states = append(states, state)
+	}
+	return selectKilledLeases(snapshot, states, confirmedAt, uncertainty)
+}
+
+func selectKilledLeases(
+	snapshot []activeLease,
+	states []leaseBoundaryState,
+	confirmedAt time.Time,
+	uncertainty time.Duration,
+) ([]activeLease, error) {
+	if confirmedAt.IsZero() {
+		return nil, errors.New("confirmed kill timestamp is zero")
+	}
+	if uncertainty < 0 || uncertainty > maxClockMappingUncertainty {
+		return nil, fmt.Errorf("kill boundary uncertainty %s is invalid", uncertainty)
+	}
+	byFence := make(map[string]leaseBoundaryState, len(states))
+	for _, state := range states {
+		key := leaseFenceKey(state.JobID, state.AttemptNo, state.Generation)
+		if _, duplicate := byFence[key]; duplicate {
+			return nil, fmt.Errorf("lease boundary state %s is duplicated", key)
+		}
+		byFence[key] = state
+	}
+	lowerBound := confirmedAt.Add(-uncertainty)
+	upperBound := confirmedAt.Add(uncertainty)
+	affected := make([]activeLease, 0, len(snapshot))
+	for _, lease := range snapshot {
+		key := leaseFenceKey(lease.JobID, lease.AttemptNo, lease.Generation)
+		state, exists := byFence[key]
+		if !exists {
+			return nil, fmt.Errorf("snapshot lease %s disappeared before boundary reconciliation", key)
+		}
+		if state.CompletedAt.IsZero() {
+			if state.State != "LEASED" && state.State != "RUNNING" {
+				return nil, fmt.Errorf("closed snapshot lease %s has no completion timestamp", key)
+			}
+			affected = append(affected, lease)
+			continue
+		}
+		if state.CompletedAt.Before(lowerBound) {
+			continue
+		}
+		if state.CompletedAt.After(upperBound) {
+			affected = append(affected, lease)
+			continue
+		}
+		return nil, fmt.Errorf(
+			"snapshot lease %s completed within uncertain kill boundary [%s,%s]",
+			key,
+			lowerBound.Format(time.RFC3339Nano),
+			upperBound.Format(time.RFC3339Nano),
+		)
+	}
+	if len(byFence) != len(snapshot) {
+		return nil, errors.New("lease boundary query returned an unrecognized fence")
+	}
+	return affected, nil
+}
+
+func leaseFenceKey(jobID string, attemptNo int, generation int64) string {
+	return fmt.Sprintf("%s/%d/%d", jobID, attemptNo, generation)
 }
 
 func readActiveWorkers(
@@ -1473,16 +1732,36 @@ func buildRecoverySamples(
 		if parseErr != nil {
 			return nil, fmt.Errorf("parse recovery completion time: %w", parseErr)
 		}
-		attempts[parts[0]] = append(attempts[parts[0]], databaseAttempt{
-			JobID:        parts[0],
-			AttemptNo:    attemptNo,
-			Generation:   generation,
-			LeasedAt:     time.Unix(0, leasedAt).UTC(),
-			CompletionAt: time.Unix(0, completedAt).UTC(),
-		})
+		attempt := databaseAttempt{
+			JobID:      parts[0],
+			AttemptNo:  attemptNo,
+			Generation: generation,
+			LeasedAt:   time.Unix(0, leasedAt).UTC(),
+		}
+		if completedAt != 0 {
+			attempt.CompletionAt = time.Unix(0, completedAt).UTC()
+		}
+		attempts[parts[0]] = append(attempts[parts[0]], attempt)
 	}
+	return scoreRecoverySamples(kills, attempts)
+}
+
+func scoreRecoverySamples(
+	kills []workerKill,
+	attempts map[string][]databaseAttempt,
+) ([]recoverySample, error) {
 	var samples []recoverySample
 	for _, kill := range kills {
+		if kill.ConfirmedHostAt.IsZero() || kill.ConfirmedAt.IsZero() {
+			return nil, fmt.Errorf("worker kill %d has no confirmed timestamp", kill.Sequence)
+		}
+		if kill.ClockMapping.Uncertainty < 0 ||
+			kill.ClockMapping.Uncertainty > maxClockMappingUncertainty {
+			return nil, fmt.Errorf("worker kill %d has invalid clock uncertainty", kill.Sequence)
+		}
+		if mapped := kill.ClockMapping.serverTime(kill.ConfirmedHostAt); !mapped.Equal(kill.ConfirmedAt) {
+			return nil, fmt.Errorf("worker kill %d clock mapping is inconsistent", kill.Sequence)
+		}
 		for _, killed := range kill.Leases {
 			var successor databaseAttempt
 			for _, attempt := range attempts[killed.JobID] {
@@ -1497,11 +1776,27 @@ func buildRecoverySamples(
 					killed.JobID, killed.Generation,
 				)
 			}
+			if successor.LeasedAt.IsZero() {
+				return nil, fmt.Errorf("job %s successor has no durable lease timestamp", killed.JobID)
+			}
 			observedAt, exists := kill.RecoveredAt[killed.JobID]
 			if !exists {
 				return nil, fmt.Errorf("job %s has no observed successor timestamp", killed.JobID)
 			}
-			recovery := observedAt.Sub(kill.ConfirmedAt)
+			if observedAt.Add(kill.ClockMapping.Uncertainty).Before(successor.LeasedAt) {
+				return nil, fmt.Errorf("job %s successor observation predates its durable lease", killed.JobID)
+			}
+			if successor.CompletionAt.IsZero() || successor.CompletionAt.Before(successor.LeasedAt) {
+				return nil, fmt.Errorf("job %s successor has no ordered durable completion", killed.JobID)
+			}
+			killUpperBound := kill.ConfirmedAt.Add(kill.ClockMapping.Uncertainty)
+			if !successor.LeasedAt.After(killUpperBound) {
+				return nil, fmt.Errorf(
+					"job %s successor lease is not after the uncertain kill boundary",
+					killed.JobID,
+				)
+			}
+			recovery := successor.LeasedAt.Sub(kill.ConfirmedAt)
 			if recovery < 0 {
 				return nil, fmt.Errorf(
 					"job %s successor lease predates confirmed worker kill",
@@ -1515,7 +1810,9 @@ func buildRecoverySamples(
 				JobID:               killed.JobID,
 				KilledAttempt:       killed.AttemptNo,
 				KilledGeneration:    killed.Generation,
+				KillConfirmedHostAt: kill.ConfirmedHostAt,
 				KillConfirmedAt:     kill.ConfirmedAt,
+				ClockMapping:        kill.ClockMapping,
 				SuccessorAttempt:    successor.AttemptNo,
 				SuccessorGeneration: successor.Generation,
 				SuccessorLeasedAt:   successor.LeasedAt,

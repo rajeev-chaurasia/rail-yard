@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/rajeev-chaurasia/rail-yard/internal/api"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/trigger"
 )
+
+var ErrWorkerCapacityConflict = errors.New("worker capacity conflicts with durable registration")
 
 type Submission struct {
 	Job            domain.JobSpec
@@ -25,6 +28,8 @@ type Store interface {
 	SubmitJob(context.Context, Submission, time.Time) (domain.Job, bool, error)
 	SubmitWorkflow(context.Context, WorkflowSubmission, time.Time) ([]domain.Job, bool, error)
 	GetJob(context.Context, string) (domain.Job, error)
+	RegisterWorker(context.Context, string, int, time.Time) error
+	HeartbeatWorker(context.Context, string, time.Time) error
 	Acquire(context.Context, string, int, int, time.Time, time.Duration) ([]domain.Lease, error)
 	MarkRunning(context.Context, string, domain.LeaseRef, time.Time) error
 	Heartbeat(context.Context, string, []domain.LeaseRef, time.Time, time.Duration) ([]api.HeartbeatResult, error)

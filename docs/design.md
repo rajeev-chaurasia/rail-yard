@@ -13,8 +13,9 @@ is not authoritative job storage.
 ## Guarantees
 
 For every durably accepted logical job, Rail Yard records exactly one canonical
-terminal outcome. Submission, Redis delivery, cron occurrence, lease, and
-completion operations are idempotent.
+terminal outcome. Submission, Redis delivery, cron occurrence, and completion
+requests are idempotent. Lease ownership is fenced by attempt, generation,
+worker, and token rather than by replaying an acquisition request.
 
 Payload execution is at least once. A worker can finish an external side effect
 and die before its completion transaction. The successor lease can then repeat
@@ -33,7 +34,7 @@ The server contains:
 
 - an HTTP control API for submissions and inspection;
 - an HTTP worker API for lease acquisition, heartbeats, and completion;
-- a serialized command loop for durable state changes;
+- a priority-aware serialized write gate for durable state changes;
 - a DAG readiness evaluator and fair scheduler;
 - a lease reaper;
 - cron and Redis Stream trigger pollers;
@@ -74,7 +75,8 @@ It exits on the first mismatch and reports the record sequence and byte offset.
 - `DEAD_LETTER`: retry budget exhausted or an upstream dependency failed.
 
 `SUCCEEDED`, `FAILED`, and `DEAD_LETTER` are terminal. Terminal jobs never move
-back to active states. Redrive creates a new job linked by `redrive_of_job_id`.
+back to active states. Redrive creates a new job and records that job ID on the
+source `dead_letters` row.
 
 ### Identifiers and fencing
 
@@ -129,7 +131,7 @@ volume.
 : Queue depth and slot limits.
 
 `queue_state`
-: Fairness weight, deficit, and cursor state.
+: Per-tenant queue fairness weight, deficit, active slots, and update time.
 
 `idempotency_requests`
 : `(tenant_id, submission_key)`, request digest, job ID, and stable response.
@@ -138,18 +140,50 @@ volume.
 : Parsed schedule metadata, durable next fire time, and unique nominal UTC
   occurrence.
 
-`redis_triggers` and `redis_deliveries`
-: Stream/group configuration and unique `(trigger_id, stream, message_id)`
-  delivery records.
+`redis_deliveries`
+: Unique `(trigger_id, stream, message_id)` delivery records. Stream and
+  consumer-group configuration comes from process configuration, not a
+  `redis_triggers` table.
 
 `dead_letters`
 : Terminal failure context and optional redrive linkage.
 
 `decision_log`
-: Global sequence, canonical input bytes, decision bytes, and SHA-256 chain.
+: Global sequence, one canonical record JSON value, and its SHA-256 chain.
+
+`operation_requests` and `audit_events`
+: Tenant and action scoped idempotency receipts plus actor-attributed audit
+  events for the operations and dashboard mutation surfaces.
+
+`dag_runs` and `dag_jobs`
+: Durable operations-facade DAG identity and node-to-job mappings.
+
+`workers`
+: Durable worker capacity registration and latest heartbeat time.
+
+`counters`
+: Durable ready sequence, scheduler sequence, and scheduler cursor values.
 
 `schema_migrations`
 : Monotonic migration version and checksum.
+
+### Migration order
+
+Embedded migrations are read in filename order and applied in one transaction.
+The current forward-only sequence is:
+
+1. `001_initial.sql`, core jobs, attempts, completions, scheduling, triggers,
+   decision log, and counters;
+2. `002_operations.sql`, operation receipts, audit events, and DAG run mapping;
+3. `003_operation_scope.sql`, tenant and action scoped operation idempotency,
+   with existing rows backfilled from their targets or assigned to `default`
+   when no target tenant can be resolved; and
+4. `004_workers.sql`, durable worker registrations.
+
+Startup stores each migration's name and SHA-256 checksum in
+`schema_migrations`. A changed checksum for an applied version prevents startup.
+There is no downgrade path, and compatibility with a newer database is not
+claimed.
 
 ### Transaction boundaries
 
@@ -169,8 +203,9 @@ Reaping atomically expires only the current generation, closes that attempt,
 releases slots, and requeues or dead-letters the job.
 
 Redis ingestion atomically deduplicates a delivery and creates its graph before
-the poller acknowledges the stream entry. A separate acknowledgement loop
-retries committed but unacknowledged deliveries.
+the poller acknowledges the stream entry. A crash before acknowledgement leaves
+the entry pending, and normal pending-entry recovery retries it against the
+durable delivery key.
 
 ## Scheduling
 
@@ -243,7 +278,10 @@ an operator responsibility.
 ## HTTP protocol
 
 All JSON requests reject unknown fields and have body-size limits. Mutating
-control requests require `Idempotency-Key`.
+control requests require `Idempotency-Key`. Every mutation under
+`/v1/operations` also requires `X-Rail-Yard-Actor`. The older `/v1` mutations
+do not accept an actor, so operator workflows should use the operations facade
+when actor attribution is required.
 
 Control endpoints:
 
@@ -271,11 +309,19 @@ Operations endpoints:
 - `GET /v1/operations/dags/{dag_id}`
 - `POST /v1/operations/operator-actions`
 - `GET /v1/operations/audit-events`
+- `GET /ops` (redirects to `/ops/`)
 - `GET /ops/`
+- `GET /ops/assets/app.css`
+- `GET /ops/assets/app.js`
+- `GET /ops/api/snapshot`
+- `GET /ops/api/dead-letters`
+- `GET /ops/api/runs/{run_id}`
+- `POST /ops/api/actions`
 
-Operator mutations require an actor and idempotency key. State history reports
-`system` for scheduler and worker transitions and the supplied actor for
-operator transitions.
+Operations API mutations require an actor header and idempotency key. Dashboard
+mutations require an actor in the request body and the dashboard CSRF cookie
+and header. State history reports `system` for scheduler and worker transitions
+and the supplied actor for operator transitions.
 
 Worker endpoints:
 
@@ -299,5 +345,7 @@ closes SQLite. Workers stop acquiring, cancel payloads, send a final heartbeat
 when possible, and exit.
 
 Liveness reports process health. Readiness requires successful migration,
-validated SQLite settings, a writable command loop, and Redis connectivity only
-when Redis triggers are configured.
+validated SQLite settings, initial telemetry collection, and Redis connectivity
+when Redis triggers are configured before the listener starts. Once listening,
+readiness reflects whether graceful shutdown has begun. It does not perform a
+fresh SQLite write or Redis probe for each request.

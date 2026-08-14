@@ -218,7 +218,7 @@ func writeCompletedRun(t *testing.T, cfg config, run int) string {
 		t.Fatalf("configuration hash: %v", err)
 	}
 	manifest := runManifest{
-		Version:           2,
+		Version:           3,
 		Run:               run,
 		Seed:              seed,
 		Project:           projectName(cfg.ProjectPrefix, run, seed),
@@ -256,12 +256,24 @@ func writeCompletedRun(t *testing.T, cfg config, run int) string {
 	if err := submitted.close(); err != nil {
 		t.Fatalf("close submitted records: %v", err)
 	}
+	mapping, err := newClockMapping(
+		started.Add(-time.Second+5*time.Millisecond),
+		started.Add(-time.Second),
+		started.Add(-time.Second+10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("create clock mapping: %v", err)
+	}
 	events, err := createJSONLines(filepath.Join(runDirectory, "events.jsonl"))
 	if err != nil {
 		t.Fatalf("create events: %v", err)
 	}
 	for sequence := 1; sequence <= cfg.WorkerKills; sequence++ {
-		details := map[string]any{"kill_sequence": sequence}
+		details := map[string]any{
+			"kill_sequence":     sequence,
+			"kill_confirmed_at": started,
+			"clock_mapping":     mapping,
+		}
 		if sequence == 1 {
 			details["active_leases"] = []activeLease{{
 				JobID:      fmt.Sprintf("%032x", 1),
@@ -300,11 +312,13 @@ func writeCompletedRun(t *testing.T, cfg config, run int) string {
 		JobID:               fmt.Sprintf("%032x", 1),
 		KilledAttempt:       1,
 		KilledGeneration:    1,
+		KillConfirmedHostAt: started,
 		KillConfirmedAt:     started,
+		ClockMapping:        mapping,
 		SuccessorAttempt:    2,
 		SuccessorGeneration: 2,
-		SuccessorLeasedAt:   started.Add(5 * time.Millisecond),
-		SuccessorObservedAt: started.Add(10 * time.Millisecond),
+		SuccessorLeasedAt:   started.Add(10 * time.Millisecond),
+		SuccessorObservedAt: started.Add(15 * time.Millisecond),
 		CompletionAt:        started.Add(time.Second),
 		RecoveryMS:          10,
 	}); err != nil {

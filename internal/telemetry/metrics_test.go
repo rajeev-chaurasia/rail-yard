@@ -43,8 +43,6 @@ func TestNewRegistersCustomCollectors(t *testing.T) {
 		"railyard_sqlite_transaction_duration_seconds",
 		"railyard_sqlite_busy_total",
 		"railyard_job_latency_seconds",
-		"railyard_redis_stream_lag",
-		"railyard_redis_pending_entries",
 	} {
 		if !names[name] {
 			t.Errorf("Gather() did not contain %q", name)
@@ -72,7 +70,7 @@ func TestRecordersUseBoundedLabels(t *testing.T) {
 	metrics.ObserveSQLiteTransaction(SQLiteComplete, SQLiteSuccess, 5*time.Millisecond)
 	metrics.RecordSQLiteBusy(SQLiteComplete)
 	metrics.ObserveJobLatency(JobEndToEnd, 2*time.Second)
-	metrics.SetRedisStreamState(11, -1)
+	metrics.SetRedisStreamState(11, 7)
 
 	if got := gaugeValue(t, metrics.Registry(), "railyard_dlq_depth", nil); got != 9 {
 		t.Fatalf("dlq depth = %v, want 9", got)
@@ -131,11 +129,40 @@ func TestRecordersUseBoundedLabels(t *testing.T) {
 		metrics.Registry(),
 		"railyard_redis_pending_entries",
 		nil,
-	); got != 0 {
-		t.Errorf("negative Redis pending entries = %v, want 0", got)
+	); got != 7 {
+		t.Errorf("Redis pending entries = %v, want 7", got)
 	}
 	if got := familyMetricCount(t, metrics.Registry(), "railyard_admissions_total"); got != 3 {
 		t.Errorf("admission series count = %d, want fixed count 3", got)
+	}
+}
+
+func TestRedisMetricsOmitUnobservableValues(t *testing.T) {
+	metrics, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if familyExists(t, metrics.Registry(), "railyard_redis_stream_lag") ||
+		familyExists(t, metrics.Registry(), "railyard_redis_pending_entries") {
+		t.Fatal("Redis metrics existed before group state was observed")
+	}
+
+	metrics.SetRedisStreamState(-1, 4)
+	if familyExists(t, metrics.Registry(), "railyard_redis_stream_lag") {
+		t.Fatal("unknown Redis lag was published")
+	}
+	if got := gaugeValue(
+		t,
+		metrics.Registry(),
+		"railyard_redis_pending_entries",
+		nil,
+	); got != 4 {
+		t.Fatalf("Redis pending entries = %v, want 4", got)
+	}
+
+	metrics.ClearRedisStreamState()
+	if familyExists(t, metrics.Registry(), "railyard_redis_pending_entries") {
+		t.Fatal("stale Redis pending entries remained published")
 	}
 }
 
@@ -250,6 +277,20 @@ func familyMetricCount(t *testing.T, gatherer prometheus.Gatherer, name string) 
 	}
 	t.Fatalf("metric family %q not found", name)
 	return 0
+}
+
+func familyExists(t *testing.T, gatherer prometheus.Gatherer, name string) bool {
+	t.Helper()
+	families, err := gatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func labelsMatch(pairs []*dto.LabelPair, labels map[string]string) bool {

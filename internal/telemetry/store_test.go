@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,16 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/store"
 	sqlitestore "github.com/rajeev-chaurasia/rail-yard/internal/store/sqlite"
 )
+
+type codedSQLiteError int
+
+func (err codedSQLiteError) Error() string {
+	return "sqlite error"
+}
+
+func (err codedSQLiteError) Code() int {
+	return int(err)
+}
 
 func TestObservedStoreCountsBatchedTransactionsAndCompletions(t *testing.T) {
 	ctx := context.Background()
@@ -105,5 +116,43 @@ func TestObservedStoreCountsBatchedTransactionsAndCompletions(t *testing.T) {
 		map[string]string{"operation": "complete", "result": "success"},
 	); got != 1 {
 		t.Fatalf("completion transaction observations = %d, want 1", got)
+	}
+}
+
+func TestSQLiteResultClassifiesExtendedBusyAndLockedCodes(t *testing.T) {
+	for _, code := range []int{5, 6, 261, 517, 773} {
+		err := fmt.Errorf("wrapped: %w", codedSQLiteError(code))
+		if got := sqliteResult(err); got != SQLiteBusy {
+			t.Errorf("sqliteResult(code %d) = %v, want busy", code, got)
+		}
+	}
+	if got := sqliteResult(errors.New("other")); got != SQLiteError {
+		t.Errorf("sqliteResult(other) = %v, want error", got)
+	}
+	if got := sqliteResult(nil); got != SQLiteSuccess {
+		t.Errorf("sqliteResult(nil) = %v, want success", got)
+	}
+
+	metrics, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := &ObservedStore{metrics: metrics}
+	observed.observeSQLite(SQLiteComplete, time.Now(), codedSQLiteError(773))
+	if got := counterValue(
+		t,
+		metrics.Registry(),
+		"railyard_sqlite_busy_total",
+		map[string]string{"operation": "complete"},
+	); got != 1 {
+		t.Errorf("SQLite busy counter = %v, want 1", got)
+	}
+	if got := histogramCount(
+		t,
+		metrics.Registry(),
+		"railyard_sqlite_transaction_duration_seconds",
+		map[string]string{"operation": "complete", "result": "busy"},
+	); got != 1 {
+		t.Errorf("SQLite busy duration observations = %d, want 1", got)
 	}
 }

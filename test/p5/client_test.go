@@ -124,7 +124,7 @@ func TestAlertStateReadsPrometheusEnvelope(t *testing.T) {
 		_, _ = w.Write([]byte(`{
 			"status":"success",
 			"data":{"alerts":[{
-				"labels":{"alertname":"RailYardQueueStalled"},
+				"labels":{"alertname":"RailYardReadyStartSLOBreach"},
 				"state":"firing"
 			}]}
 		}`))
@@ -135,18 +135,51 @@ func TestAlertStateReadsPrometheusEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := client.AlertState(context.Background(), queueStalledAlert)
+	state, err := client.AlertState(context.Background(), readyStartSLOAlert)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if state != "firing" {
 		t.Fatalf("state = %q, want firing", state)
 	}
-	inactive, err := client.AlertState(context.Background(), recoverySLOAlert)
+	inactive, err := client.AlertState(context.Background(), dlqDepthHighAlert)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if inactive != "inactive" {
 		t.Fatalf("missing alert state = %q, want inactive", inactive)
+	}
+}
+
+func TestAlertRulesReadsConfiguredSLOAlerts(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/rules" || request.URL.Query().Get("type") != "alert" {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"success",
+			"data":{"groups":[{"rules":[
+				{"name":"RailYardReadyStartSLOBreach","type":"alerting"},
+				{"name":"RailYardDLQDepthHigh","type":"alerting"}
+			]}]}
+		}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, server.URL, "qa-operator", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := client.AlertRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{readyStartSLOAlert, dlqDepthHighAlert} {
+		if !rules[name] {
+			t.Errorf("configured alert %q was not returned", name)
+		}
 	}
 }

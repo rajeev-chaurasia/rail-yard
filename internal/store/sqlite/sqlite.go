@@ -23,7 +23,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const busyTimeoutMS = 5000
+const (
+	busyTimeoutMS = 5000
+	openTimeout   = 30 * time.Second
+)
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
@@ -35,7 +38,6 @@ type Store struct {
 	maxSlotCost         int
 	allowShell          bool
 	writes              *writeGate
-	redriveMu           sync.Mutex
 	attemptStartCommits atomic.Uint64
 	completionCommits   atomic.Uint64
 	clockOrigin         time.Time
@@ -98,7 +100,7 @@ func OpenWithOptions(path string, options Options) (*Store, error) {
 		allowShell:         options.AllowShell,
 		writes:             newWriteGate(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), openTimeout)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {

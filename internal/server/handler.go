@@ -454,26 +454,29 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.workersMu.Lock()
-	existingSlots, registered := s.workers[request.WorkerID]
-	if !registered {
-		s.workers[request.WorkerID] = request.Slots
-	}
-	s.workersMu.Unlock()
-	if registered && existingSlots != request.Slots {
-		writeHTTPError(w, &httpError{
-			status:  http.StatusConflict,
-			code:    "worker_conflict",
-			message: "worker is already registered with a different slot capacity",
-		})
+	now := s.config.Now().UTC()
+	if err := s.store.RegisterWorker(r.Context(), request.WorkerID, request.Slots, now); err != nil {
+		if errors.Is(err, store.ErrWorkerCapacityConflict) {
+			writeHTTPError(w, &httpError{
+				status:  http.StatusConflict,
+				code:    "worker_conflict",
+				message: "worker is already registered with a different slot capacity",
+			})
+			return
+		}
+		writeStoreError(w, err)
 		return
 	}
+
+	s.workersMu.Lock()
+	s.workers[request.WorkerID] = request.Slots
+	s.workersMu.Unlock()
 
 	writeJSON(w, http.StatusOK, api.RegisterWorkerResponse{
 		WorkerID:       request.WorkerID,
 		HeartbeatEvery: s.config.HeartbeatEvery,
 		LeaseTTL:       s.config.LeaseTTL,
-		ServerTime:     s.config.Now().UTC(),
+		ServerTime:     now,
 	})
 }
 
@@ -683,9 +686,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, workerI
 		writeHTTPError(w, requestError)
 		return
 	}
-	if len(request.Leases) == 0 || len(request.Leases) > s.config.MaxHeartbeatBatch {
+	if len(request.Leases) > s.config.MaxHeartbeatBatch {
 		writeHTTPError(w, invalidRequest(fmt.Sprintf(
-			"leases must contain between 1 and %d items",
+			"leases must contain at most %d items",
 			s.config.MaxHeartbeatBatch,
 		)))
 		return
@@ -697,11 +700,16 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, workerI
 		}
 	}
 
+	now := s.config.Now().UTC()
+	if err := s.store.HeartbeatWorker(r.Context(), workerID, now); err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	results, err := s.store.Heartbeat(
 		r.Context(),
 		workerID,
 		request.Leases,
-		s.config.Now().UTC(),
+		now,
 		s.config.LeaseTTL,
 	)
 	if err != nil {

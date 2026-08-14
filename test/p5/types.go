@@ -147,3 +147,15 @@ type prometheusAlert struct {
 	Labels map[string]string `json:"labels"`
 	State  string            `json:"state"`
 }
+
+type prometheusRulesResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Groups []struct {
+			Rules []struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+			} `json:"rules"`
+		} `json:"groups"`
+	} `json:"data"`
+}

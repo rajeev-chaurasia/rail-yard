@@ -2,15 +2,17 @@
 
 ## Scope
 
-This walkthrough is an acceptance drill, not qualification evidence. It:
+This walkthrough is a qualification drill for a fresh disposable stack. It:
 
 1. submits a three-node DAG and observes every node running in dependency order;
 2. sends `SIGKILL` to a worker and observes a fenced successor attempt;
 3. drives a one-attempt job into `DEAD_LETTER`;
 4. lists and redrives that dead letter through the control API;
 5. verifies durable actor and timestamp records for each operator action; and
-6. pairs the lifecycle report with deterministic fire-and-recovery evidence
-   for `RailYardReadyStartSLOBreach` and `RailYardDLQDepthHigh`.
+6. observes live fire and recovery for `RailYardReadyStartSLOBreach` and
+   `RailYardDLQDepthHigh`; and
+7. pairs the lifecycle report with retained promtool fire-and-recovery
+   evidence for both rules.
 
 The recovery drill intentionally leaves the killed worker unavailable for nine
 seconds. It is supposed to breach the five-second recovery target. Do not use
@@ -52,6 +54,7 @@ GET /v1/operations/audit-events?since=<RFC3339Nano>&actor=<actor>
   "events": [
     {
       "id": "immutable-event-id",
+      "tenant_id": "default",
       "action": "dead_letter.redrive",
       "actor": "p5-acceptance",
       "occurred_at": "2032-03-14T15:09:26.123456789Z",
@@ -100,6 +103,7 @@ The response is `201 Created`, or `200 OK` for an identical duplicate:
 {
   "event": {
     "id": "immutable-event-id",
+    "tenant_id": "default",
     "action": "worker.kill",
     "actor": "p5-acceptance",
     "occurred_at": "2032-03-14T15:09:26.223456789Z",
@@ -115,11 +119,13 @@ The response is `201 Created`, or `200 OK` for an identical duplicate:
 
 The same endpoint records `alert.exercise.start` and
 `alert.exercise.recover`. Forced dead-letter and redrive actions are recorded
-by their existing operations handlers. The external action endpoint must use
-an allowlist for action and target types, request size limits, and the same
-authentication boundary as other operator controls.
+by their existing operations handlers. The endpoint enforces non-empty bounded
+action and target identifiers, at most 64 detail entries, a 1 MiB body limit,
+an actor header, and an idempotency key. It does not enforce an action or target
+type allowlist, authentication, or authorization. Deployments must provide the
+authentication and authorization boundary before exposing operator controls.
 
-The existing P5 routes are also required:
+The walkthrough uses this subset of the mounted P5 and dashboard routes:
 
 ```text
 POST /v1/operations/dags
@@ -139,8 +145,8 @@ dashboard dead-letter API must show the same job before redrive.
 
 ### SLO validation
 
-The operations walkthrough validates the job lifecycle. Promtool validates
-both SLO alert state machines with deterministic breach and recovery series:
+Promtool validates both SLO alert state machines with deterministic breach and
+recovery series:
 
 ```sh
 promtool check rules deploy/prometheus/alerts.yml
@@ -152,8 +158,26 @@ Prometheus must load these alert names:
 - `RailYardReadyStartSLOBreach`;
 - `RailYardDLQDepthHigh`.
 
-Pass `--skip-live-alerts` to the walkthrough when the promtool evidence is
-validated separately.
+The walkthrough command runs both promtool checks before the live drill and
+retains `promtool-check.log`, `promtool-test.log`, `slo-summary.json`,
+`walkthrough.json`, and `SHA256SUMS` in the report directory.
+
+The live drill stops the workers, creates 10 current unredriven dead letters,
+and submits 20 jobs that remain ready for more than five seconds. It then
+starts the workers and observes the ready-start alert after its five-minute
+`for` duration. Recovery uses 2,400 bounded no-op observations in batches of
+100, which raises the controlled population above the 99 percent threshold
+without waiting for the 30-minute window to expire.
+
+The 10 dead letters remain unredriven through the alert's ten-minute `for`
+duration. After Prometheus reports the alert firing, the harness redrives all
+10 entries, verifies the current depth is zero, and observes the alert become
+inactive.
+
+The walkthrough report retains actual observation times only. For compatibility
+with the release audit schema, `recovery_alert_*` contains the ready-start SLO
+times and `queue_alert_*` contains the DLQ depth times. A normal run takes about
+12 to 18 minutes. The acceptance command uses a 35-minute bound.
 
 ## Start the disposable stack
 
@@ -197,7 +221,7 @@ go run ./test/p5/cmd/walkthrough \
   -compose-project "$COMPOSE_PROJECT_NAME" \
   -run-id "$RUN_ID" \
   -actor p5-walkthrough \
-  -skip-live-alerts \
+  -slo-rule-evidence slo-summary.json \
   -output "results/_work/p5/$RUN_ID/walkthrough.json" \
   -timeout 35m
 ```
@@ -213,7 +237,6 @@ The independent Go acceptance test exercises the same black-box path:
 RAILYARD_P5_ACCEPTANCE=1 \
 RAILYARD_P5_RUN_ID="$RUN_ID" \
 RAILYARD_P5_ACTOR=p5-acceptance \
-RAILYARD_P5_SKIP_LIVE_ALERTS=1 \
 RAILYARD_P5_COMPOSE_PROJECT="$COMPOSE_PROJECT_NAME" \
 go test ./test/p5 \
   -run '^TestOperationsWalkthrough$' \
@@ -305,10 +328,10 @@ Reserved locations:
 ```text
 results/_work/p5/<RUN_ID>/screenshots/
   01-operator-dashboard.png
-  02-recovery-slo-firing.png
-  02-recovery-slo-recovered.png
-  03-queue-stalled-firing.png
-  03-queue-stalled-recovered.png
+  02-ready-start-slo-firing.png
+  02-ready-start-slo-recovered.png
+  03-dlq-depth-firing.png
+  03-dlq-depth-recovered.png
 ```
 
 Inspect each image before retaining it.

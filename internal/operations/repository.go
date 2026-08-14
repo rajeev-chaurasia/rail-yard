@@ -58,15 +58,25 @@ type ForceJobController interface {
 	ForceJobAction(context.Context, ForceJobCommand) (ActionReceipt, error)
 }
 
+type OperatorActionRecorder interface {
+	RecordOperatorAction(context.Context, OperatorActionCommand) (OperatorActionResponse, error)
+}
+
+type AuditEventReader interface {
+	ListAuditEvents(context.Context, AuditEventQuery) (AuditEventResponse, error)
+}
+
 type Repositories struct {
-	JobSubmitter       JobSubmitter
-	DAGSubmitter       DAGSubmitter
-	JobReader          JobReader
-	JobHistoryReader   JobHistoryReader
-	JobCanceller       JobCanceller
-	DeadLetterRedriver DeadLetterRedriver
-	QueueDepthReader   QueueDepthReader
-	WorkerHealthReader WorkerHealthReader
-	DAGReader          DAGReader
-	ForceJobController ForceJobController
+	JobSubmitter           JobSubmitter
+	DAGSubmitter           DAGSubmitter
+	JobReader              JobReader
+	JobHistoryReader       JobHistoryReader
+	JobCanceller           JobCanceller
+	DeadLetterRedriver     DeadLetterRedriver
+	QueueDepthReader       QueueDepthReader
+	WorkerHealthReader     WorkerHealthReader
+	DAGReader              DAGReader
+	ForceJobController     ForceJobController
+	OperatorActionRecorder OperatorActionRecorder
+	AuditEventReader       AuditEventReader
 }

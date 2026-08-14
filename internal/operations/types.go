@@ -10,6 +10,7 @@ import (
 
 type SubmitJobCommand struct {
 	Request        api.SubmitJobRequest
+	Actor          string
 	IdempotencyKey string
 	RequestDigest  string
 	RequestedAt    time.Time
@@ -17,6 +18,7 @@ type SubmitJobCommand struct {
 
 type SubmitDAGCommand struct {
 	Request        api.SubmitWorkflowRequest
+	Actor          string
 	IdempotencyKey string
 	RequestDigest  string
 	RequestedAt    time.Time
@@ -160,4 +162,45 @@ type CancelJobRequest struct {
 type ForceJobRequest struct {
 	Action ForceAction `json:"action"`
 	Reason string      `json:"reason"`
+}
+
+type OperatorActionRequest struct {
+	TenantID   string            `json:"tenant_id,omitempty"`
+	Action     string            `json:"action"`
+	TargetType string            `json:"target_type"`
+	TargetID   string            `json:"target_id"`
+	Details    map[string]string `json:"details,omitempty"`
+}
+
+type OperatorActionCommand struct {
+	Request        OperatorActionRequest
+	Actor          string
+	IdempotencyKey string
+	RequestDigest  string
+	RequestedAt    time.Time
+}
+
+type AuditEvent struct {
+	ID         string            `json:"id"`
+	TenantID   string            `json:"tenant_id"`
+	Action     string            `json:"action"`
+	Actor      string            `json:"actor"`
+	OccurredAt time.Time         `json:"occurred_at"`
+	TargetType string            `json:"target_type"`
+	TargetID   string            `json:"target_id"`
+	Details    map[string]string `json:"details,omitempty"`
+}
+
+type OperatorActionResponse struct {
+	Event     AuditEvent `json:"event"`
+	Duplicate bool       `json:"duplicate"`
+}
+
+type AuditEventQuery struct {
+	Since time.Time
+	Actor string
+}
+
+type AuditEventResponse struct {
+	Events []AuditEvent `json:"events"`
 }

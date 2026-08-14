@@ -5,6 +5,89 @@ is valid only after the benchmark runner drains the workload, an operator stops
 all database writers, and the reconciliation command validates a consistent
 SQLite snapshot.
 
+## Published evidence status
+
+No committed throughput or chaos directory currently satisfies the
+qualification contract. Content under `results/_work/` is scratch output and
+must not be cited as a published result.
+
+The committed SLO summary at `results/slo/20260814T104500Z/summary.json`
+records deterministic promtool rule tests only. It does not prove a live alert
+fired or recovered. The committed P5 walkthrough at
+`results/p5/20260814T124900Z/walkthrough.json` skipped live alert waits and
+lacks the current alert timestamps, retained promtool logs, and checksums. It
+is useful historical lifecycle output, but it is not current P5 qualification
+evidence.
+
+## Replay qualification
+
+`results/replay/20260814T102800Z/summary.json` is superseded. Its command used
+in-process replay calls, so its `clean_process_replays` value is not
+clean-process evidence and the summary must not be used in a release audit.
+
+Create replacement evidence in a new directory:
+
+```sh
+go run ./test/replay \
+  --output results/_work/replay-qualification-<run-id>
+```
+
+Supply `--input <decision-log.jsonl>` to consume an existing capture. The
+qualifier verifies and canonicalizes exactly 50,000 chained decisions, or
+creates that input when the flag is omitted. It builds the real
+`railyard-replay` command, starts three separate operating system processes,
+records each process ID and command, and byte-compares every output with the
+captured canonical decisions and with the other outputs. It publishes the
+evidence directory only after every comparison and reported digest passes.
+`SHA256SUMS` is written atomically and verified before publication.
+
+Use the generated `summary.json` as the release audit replay input. The
+`manifest.json`, replay input, canonical decisions, three replay outputs, and
+`SHA256SUMS` are required supporting evidence.
+
+Replay qualification intentionally has no resume mode. The output directory
+must not already exist. Start a replacement in a new directory after an
+interruption.
+
+## Chaos qualification
+
+Run the resumable chaos tool directly because the bounded CI wrapper does not
+expose the resume flag:
+
+```sh
+go run ./test/chaos \
+  --resume \
+  --compose-file deploy/compose.yaml \
+  --project-prefix railyard-qualification-chaos \
+  --runs 10 \
+  --jobs 50000 \
+  --worker-kills 20 \
+  --job-duration 250ms \
+  --action-min 100ms \
+  --action-max 500ms \
+  --seed <recorded-base-seed> \
+  --output results/_work/chaos-qualification-<run-id>
+```
+
+`--resume` is safe for a new chaos output directory. It reuses only completed
+runs whose configuration hash, finalized manifest, checksums, submitted
+records, reconciliation, action trace, recovery samples, and database snapshot
+all validate. Invalid prior run directories are moved under `.invalid/`.
+
+The output root contains `summary.json`. Each timestamped run directory
+contains `manifest.json`, `submitted.jsonl`, `events.jsonl`,
+`recovery-samples.jsonl`, `reconciliation.json`, the database snapshot,
+Compose logs, and `SHA256SUMS`. The campaign summary alone is not sufficient
+release evidence.
+
+The current release-audit reader in `hack/results` still expects chaos manifest
+version 2 and the older recovery sample shape and timing definition. The chaos
+harness and resume verifier emit and validate manifest version 3, including
+host-to-server clock mapping, and define `recovery_ms` from confirmed mapped
+kill time to durable successor lease time. Until the release-audit reader is
+updated, new chaos output cannot produce a final activation summary even when
+the campaign itself passes.
+
 ## Command contract
 
 The Compose orchestrator performs the warm-up, measured fresh-volume runs,
@@ -18,7 +101,7 @@ go run ./test/benchmark \
   --jobs 50000 \
   --workers 8 \
   --worker-slots 256 \
-  --output results/throughput/<suite-directory>
+  --output results/_work/benchmark-qualification-<run-id>
 ```
 
 Resume an interrupted suite with the same immutable options and output
@@ -33,7 +116,7 @@ go run ./test/benchmark \
   --jobs 50000 \
   --workers 8 \
   --worker-slots 256 \
-  --output results/throughput/<suite-directory>
+  --output results/_work/benchmark-qualification-<run-id>
 ```
 
 Resume verifies the orchestration checkpoint and every completed run's
@@ -192,3 +275,44 @@ evidence. The manifest also records separate SHA-256 digests for the database,
 WAL, and shared-memory snapshot components that exist. Lease rates and
 lease-based latency are unavailable until a valid SQLite snapshot supplies
 exact durable timestamps.
+
+## P5 qualification
+
+The current walkthrough writes one self-contained evidence directory:
+
+```sh
+go run ./test/p5/cmd/walkthrough \
+  --repo-root . \
+  --compose-file deploy/compose.yaml \
+  --compose-project <fresh-project> \
+  --run-id <run-id> \
+  --actor qualification \
+  --slo-rule-evidence slo-summary.json \
+  --output results/_work/p5/<run-id>/walkthrough.json \
+  --timeout 35m
+```
+
+A passing directory contains `walkthrough.json`, `slo-summary.json`,
+`promtool-check.log`, `promtool-test.log`, and `SHA256SUMS`. The walkthrough
+report must have nonzero fire and recovery timestamps for
+`RailYardReadyStartSLOBreach` and `RailYardDLQDepthHigh`,
+`live_alert_waits_skipped` must be false, and `passed` must be true. P5 has no
+resume mode and requires a fresh disposable Compose project.
+
+## Final release audit
+
+After the chaos reader incompatibility above is fixed, generate the immutable
+activation decision from the five checked summaries:
+
+```sh
+go run ./hack/results \
+  --benchmark-suite <benchmark-output>/suite/benchmark-summary.json \
+  --chaos-campaign <chaos-output>/summary.json \
+  --replay-summary <replay-output>/summary.json \
+  --slo-summary <p5-output>/slo-summary.json \
+  --p5-walkthrough <p5-output>/walkthrough.json \
+  --output results/_work/qualification-<run-id>.json
+```
+
+The output path must be new. The command verifies each input directory's
+checksums and exits nonzero for invalid evidence or a measured miss.

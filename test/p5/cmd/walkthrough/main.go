@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/rajeev-chaurasia/rail-yard/internal/evidence"
 	"github.com/rajeev-chaurasia/rail-yard/test/p5"
 )
 
@@ -51,13 +52,19 @@ func run() error {
 		&config.RecoveryHold,
 		"recovery-hold",
 		config.RecoveryHold,
-		"worker outage used to breach the recovery SLO",
+		"worker outage used by the reassignment drill",
 	)
-	flag.BoolVar(
-		&config.SkipLiveAlerts,
-		"skip-live-alerts",
-		false,
-		"skip live alert waits when promtool evidence is validated separately",
+	flag.DurationVar(
+		&config.ReadyBreachHold,
+		"ready-breach-hold",
+		config.ReadyBreachHold,
+		"worker pause used to breach ready-start latency",
+	)
+	flag.StringVar(
+		&config.SLORuleEvidence,
+		"slo-rule-evidence",
+		config.SLORuleEvidence,
+		"rule-test summary path relative to the walkthrough report",
 	)
 	flag.DurationVar(&totalTimeout, "timeout", 35*time.Minute, "whole walkthrough timeout")
 	flag.StringVar(
@@ -78,14 +85,17 @@ func run() error {
 			"walkthrough.json",
 		)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
+	defer cancel()
+	if err := p5.RetainSLORuleEvidence(ctx, config.RepositoryRoot, filepath.Dir(output)); err != nil {
+		return err
+	}
 	runner, err := p5.NewRunner(config, func(format string, args ...any) {
 		fmt.Printf(format+"\n", args...)
 	})
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
-	defer cancel()
 	report, err := runner.Run(ctx)
 	if err != nil {
 		return err
@@ -99,6 +109,9 @@ func run() error {
 	}
 	if err := os.WriteFile(output, append(encoded, '\n'), 0o640); err != nil {
 		return fmt.Errorf("write completed walkthrough report: %w", err)
+	}
+	if err := evidence.GenerateChecksums(filepath.Dir(output)); err != nil {
+		return fmt.Errorf("write evidence checksums: %w", err)
 	}
 	fmt.Printf("completed report: %s\n", output)
 	return nil

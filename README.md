@@ -16,8 +16,8 @@ evidence. Resume material will use only measured results.
 - [x] DAG scheduler, triggers, retries, and dead-letter queue
 - [x] Deterministic replay harness
 - [ ] Full chaos qualification campaign
-- [ ] Benchmarks, dashboard, runbook, and measured results
-- [x] Operations API, internal dashboard, audit trail, and SLO evidence
+- [ ] Qualified benchmarks and measured results
+- [x] Operations API, internal dashboard, audit trail, SLO rules, and harnesses
 
 ## Correctness contract
 
@@ -104,12 +104,15 @@ after a crash is harmless.
 
 The server exposes bounded-cardinality Prometheus metrics for:
 
-- scheduling and completion rate;
-- queue depth and admission rejections;
-- lease expiry and reassignment latency;
-- retry and dead-letter counts;
-- SQLite transaction latency and busy time; and
-- end-to-end job latency.
+- worker-protocol scheduling, completion, admission, and rejection outcomes;
+- durable aggregate queue depth by state and current unredriven dead-letter
+  depth;
+- lease expiry and durable successor-lease recovery latency;
+- SQLite latency and busy outcomes for instrumented job-protocol storage calls;
+- ready-to-lease, lease-to-completion, and terminal end-to-end latency from
+  durable timestamps; and
+- configured Redis consumer-group pending entries and lag when Redis reports
+  the value.
 
 The reference Docker Compose environment includes the provisioned
 [Grafana dashboard](deploy/grafana/dashboards/railyard-overview.json),
@@ -161,6 +164,11 @@ actor-aware audit trail, and explicit SLO alerting.
 - Alert when fewer than 99% of ready jobs start within five seconds or when the
   dead-letter queue exceeds its documented threshold.
 
+Every `/v1/operations` mutation requires `X-Rail-Yard-Actor` and an
+`Idempotency-Key`. Dashboard mutations require an actor in the JSON body plus
+the dashboard CSRF cookie and header. The older `/v1` mutation routes are not
+actor-attributed, so they are not the operator audit surface.
+
 Gate: complete a recorded DAG lifecycle through the API and dashboard, then
 prove both SLO alerts fire and recover under deliberate breaches.
 
@@ -185,9 +193,10 @@ These are acceptance targets, not achieved results:
 6. **SLO validation:** both committed SLO alerts fire and recover in
    deterministic rule tests and an integration walkthrough.
 
-Raw manifests, seeds, action traces, reconciliation reports, samples, replay
-digests, and checksums will be committed under `results/`. If a result misses a
-target, the measured number will be published unchanged.
+Candidate qualification output is written under `results/_work/`. Only a
+reviewed, complete evidence set with the required manifests, raw samples,
+reconciliation, and checksums may be promoted to a published result directory.
+If a result misses a target, the measured number will be published unchanged.
 
 ## Technology
 

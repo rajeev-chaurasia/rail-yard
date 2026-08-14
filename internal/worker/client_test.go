@@ -280,6 +280,88 @@ func TestHTTPClientMapsStaleLease(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDistinguishesMissingWorkerFromMissingJob(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusNotFound)
+		message := "worker is not registered"
+		if strings.HasSuffix(request.URL.Path, "/attempts/start") {
+			message = "resource not found"
+		}
+		_ = json.NewEncoder(writer).Encode(api.ErrorResponse{
+			Code:    "not_found",
+			Message: message,
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, acquireErr := client.AcquireLeases(
+		context.Background(),
+		"worker-1",
+		api.AcquireLeasesRequest{AvailableSlots: 1, Limit: 1},
+	)
+	if !workerRegistrationMissing(acquireErr) {
+		t.Fatalf("acquire error = %v, want missing worker registration", acquireErr)
+	}
+	var apiErr *APIError
+	if !errors.As(acquireErr, &apiErr) ||
+		apiErr.Path != "/v1/workers/worker-1/leases/acquire" {
+		t.Fatalf("acquire error context = %#v", apiErr)
+	}
+
+	startErr := client.StartAttempt(
+		context.Background(),
+		"worker-1",
+		api.StartAttemptRequest{LeaseRef: domain.LeaseRef{JobID: "missing-job"}},
+	)
+	if workerRegistrationMissing(startErr) {
+		t.Fatalf("job error = %v, must not trigger worker registration", startErr)
+	}
+}
+
+func TestHTTPClientDoesNotFallbackBatchForMissingWorker(t *testing.T) {
+	batchCalls := 0
+	singleCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/workers/worker-1/attempts/start-batch":
+			batchCalls++
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(
+				writer,
+				`{"code":"not_found","message":"worker is not registered"}`,
+			)
+		case "/v1/workers/worker-1/attempts/start":
+			singleCalls++
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected path %q", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.StartAttempts(
+		context.Background(),
+		"worker-1",
+		api.StartAttemptsRequest{Leases: []domain.LeaseRef{{JobID: "job-1"}}},
+	)
+	if !workerRegistrationMissing(err) {
+		t.Fatalf("error = %v, want missing worker registration", err)
+	}
+	if batchCalls != 1 || singleCalls != 0 {
+		t.Fatalf("batch calls = %d, single calls = %d", batchCalls, singleCalls)
+	}
+}
+
 func TestHTTPClientRetriesOnlyTransportFailures(t *testing.T) {
 	var mu sync.Mutex
 	calls := 0

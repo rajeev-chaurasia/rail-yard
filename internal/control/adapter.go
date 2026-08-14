@@ -14,7 +14,6 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/dashboard"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/operations"
-	storepkg "github.com/rajeev-chaurasia/rail-yard/internal/store"
 	"github.com/rajeev-chaurasia/rail-yard/internal/store/sqlite"
 )
 
@@ -29,16 +28,18 @@ func New(store *sqlite.Store) *Adapter {
 
 func (a *Adapter) Repositories() operations.Repositories {
 	return operations.Repositories{
-		JobSubmitter:       a,
-		DAGSubmitter:       a,
-		JobReader:          a,
-		JobHistoryReader:   a,
-		JobCanceller:       a,
-		DeadLetterRedriver: a,
-		QueueDepthReader:   a,
-		WorkerHealthReader: a,
-		DAGReader:          a,
-		ForceJobController: a,
+		JobSubmitter:           a,
+		DAGSubmitter:           a,
+		JobReader:              a,
+		JobHistoryReader:       a,
+		JobCanceller:           a,
+		DeadLetterRedriver:     a,
+		QueueDepthReader:       a,
+		WorkerHealthReader:     a,
+		DAGReader:              a,
+		ForceJobController:     a,
+		OperatorActionRecorder: a,
+		AuditEventReader:       a,
 	}
 }
 
@@ -46,86 +47,15 @@ func (a *Adapter) SubmitJob(
 	ctx context.Context,
 	command operations.SubmitJobCommand,
 ) (api.SubmitJobResponse, error) {
-	job, duplicate, err := a.store.SubmitJob(ctx, storepkg.Submission{
-		Job:            command.Request.Job,
-		IdempotencyKey: command.IdempotencyKey,
-		RequestDigest:  command.RequestDigest,
-	}, command.RequestedAt)
-	if err != nil {
-		return api.SubmitJobResponse{}, err
-	}
-	response := api.SubmitJobResponse{Job: job, Duplicate: duplicate}
-	_, err = a.store.RecordControlAction(ctx, sqlite.ControlAction{
-		IdempotencyKey: command.IdempotencyKey,
-		Action:         "job.submit",
-		Actor:          requestActor(ctx),
-		RequestDigest:  command.RequestDigest,
-		CommittedAt:    command.RequestedAt,
-		TargetType:     "job",
-		TargetID:       job.ID,
-		TargetState:    job.State,
-		TargetVersion:  job.StateVersion,
-		Response:       response,
-		Details:        map[string]string{"tenant_id": job.TenantID, "queue": job.Queue},
-	})
-	if err != nil {
-		return api.SubmitJobResponse{}, err
-	}
-	return response, nil
+	return a.store.SubmitJobOperation(ctx, command)
 }
 
 func (a *Adapter) SubmitDAG(
 	ctx context.Context,
 	command operations.SubmitDAGCommand,
 ) (operations.SubmitDAGResponse, error) {
-	jobs, duplicate, err := a.store.SubmitWorkflow(ctx, storepkg.WorkflowSubmission{
-		Request:        command.Request,
-		IdempotencyKey: command.IdempotencyKey,
-		RequestDigest:  command.RequestDigest,
-	}, command.RequestedAt)
-	if err != nil {
-		return operations.SubmitDAGResponse{}, err
-	}
 	dagID := deterministicDAGID(command.Request.TenantID, command.IdempotencyKey)
-	nodes := make([]sqlite.DAGNode, len(jobs))
-	for index, job := range jobs {
-		nodes[index] = sqlite.DAGNode{
-			JobID: job.ID,
-			Key:   command.Request.Nodes[index].Key,
-			Name:  command.Request.Nodes[index].Job.Name,
-		}
-	}
-	if err := a.store.SaveDAG(
-		ctx,
-		dagID,
-		command.Request.TenantID,
-		command.IdempotencyKey,
-		command.RequestDigest,
-		nodes,
-		command.RequestedAt,
-	); err != nil {
-		return operations.SubmitDAGResponse{}, err
-	}
-	response := operations.SubmitDAGResponse{
-		DAGID:     dagID,
-		Jobs:      jobs,
-		Duplicate: duplicate,
-	}
-	_, err = a.store.RecordControlAction(ctx, sqlite.ControlAction{
-		IdempotencyKey: command.IdempotencyKey,
-		Action:         "dag.submit",
-		Actor:          requestActor(ctx),
-		RequestDigest:  command.RequestDigest,
-		CommittedAt:    command.RequestedAt,
-		TargetType:     "dag",
-		TargetID:       dagID,
-		Response:       response,
-		Details:        map[string]string{"tenant_id": command.Request.TenantID},
-	})
-	if err != nil {
-		return operations.SubmitDAGResponse{}, err
-	}
-	return response, nil
+	return a.store.SubmitDAGOperation(ctx, dagID, command)
 }
 
 func (a *Adapter) GetJob(ctx context.Context, jobID string) (domain.Job, error) {
@@ -209,6 +139,38 @@ func (a *Adapter) ForceJobAction(
 		NextState:      state,
 		Release:        release,
 	})
+}
+
+func (a *Adapter) RecordOperatorAction(
+	ctx context.Context,
+	command operations.OperatorActionCommand,
+) (operations.OperatorActionResponse, error) {
+	event, duplicate, err := a.store.RecordOperatorAction(ctx, sqlite.ControlAction{
+		TenantID:       command.Request.TenantID,
+		IdempotencyKey: command.IdempotencyKey,
+		Action:         command.Request.Action,
+		Actor:          command.Actor,
+		RequestDigest:  command.RequestDigest,
+		CommittedAt:    command.RequestedAt,
+		TargetType:     command.Request.TargetType,
+		TargetID:       command.Request.TargetID,
+		Details:        command.Request.Details,
+	})
+	if err != nil {
+		return operations.OperatorActionResponse{}, err
+	}
+	return operations.OperatorActionResponse{Event: event, Duplicate: duplicate}, nil
+}
+
+func (a *Adapter) ListAuditEvents(
+	ctx context.Context,
+	query operations.AuditEventQuery,
+) (operations.AuditEventResponse, error) {
+	events, err := a.store.ListAuditEvents(ctx, query.Since, query.Actor)
+	if err != nil {
+		return operations.AuditEventResponse{}, err
+	}
+	return operations.AuditEventResponse{Events: events}, nil
 }
 
 func (a *Adapter) Snapshot(ctx context.Context) (dashboard.Snapshot, error) {
@@ -336,15 +298,17 @@ func dashboardError(err error) error {
 }
 
 var (
-	_ operations.JobSubmitter       = (*Adapter)(nil)
-	_ operations.DAGSubmitter       = (*Adapter)(nil)
-	_ operations.JobReader          = (*Adapter)(nil)
-	_ operations.JobHistoryReader   = (*Adapter)(nil)
-	_ operations.JobCanceller       = (*Adapter)(nil)
-	_ operations.DeadLetterRedriver = (*Adapter)(nil)
-	_ operations.QueueDepthReader   = (*Adapter)(nil)
-	_ operations.WorkerHealthReader = (*Adapter)(nil)
-	_ operations.DAGReader          = (*Adapter)(nil)
-	_ operations.ForceJobController = (*Adapter)(nil)
-	_ dashboard.Client              = (*Adapter)(nil)
+	_ operations.JobSubmitter           = (*Adapter)(nil)
+	_ operations.DAGSubmitter           = (*Adapter)(nil)
+	_ operations.JobReader              = (*Adapter)(nil)
+	_ operations.JobHistoryReader       = (*Adapter)(nil)
+	_ operations.JobCanceller           = (*Adapter)(nil)
+	_ operations.DeadLetterRedriver     = (*Adapter)(nil)
+	_ operations.QueueDepthReader       = (*Adapter)(nil)
+	_ operations.WorkerHealthReader     = (*Adapter)(nil)
+	_ operations.DAGReader              = (*Adapter)(nil)
+	_ operations.ForceJobController     = (*Adapter)(nil)
+	_ operations.OperatorActionRecorder = (*Adapter)(nil)
+	_ operations.AuditEventReader       = (*Adapter)(nil)
+	_ dashboard.Client                  = (*Adapter)(nil)
 )

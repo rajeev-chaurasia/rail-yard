@@ -51,7 +51,7 @@ per minute. Also report p50, p95, and p99 admission-to-lease,
 lease-to-completion, and end-to-end latency.
 
 Absolute performance is qualified on a documented dedicated host. Shared CI
-runners execute only a smoke benchmark and do not create resume evidence.
+runners execute only smoke coverage and do not create résumé evidence.
 
 ## Chaos campaign
 
@@ -107,27 +107,25 @@ human log bytes are not replay targets.
 
 ## Evidence layout
 
-Every run writes a unique immutable directory:
+The harnesses have separate versioned contracts. They do not emit one universal
+run shape.
 
-```text
-results/<kind>/<UTC timestamp>-<short commit>/
-  manifest.json
-  submitted.jsonl
-  events.jsonl
-  reconciliation.json
-  recovery-samples.jsonl
-  benchmark-samples.jsonl
-  benchmark-summary.json
-  replay-input.jsonl
-  replay-output.jsonl
-  replay.sha256
-  metrics.prom
-  logs/
-  SHA256SUMS
-```
+- Benchmark output contains `orchestration-checkpoint.json`, one warm-up and
+  three measured directories under `runs/`, a `suite/` aggregate, captured
+  orchestration files, raw samples, reconciliation, manifests, and checksums.
+- Each chaos run contains `manifest.json`, `submitted.jsonl`, `events.jsonl`,
+  `recovery-samples.jsonl`, `reconciliation.json`, the quiesced database
+  snapshot, Compose logs, and `SHA256SUMS`. The output root also contains the
+  campaign `summary.json`.
+- Replay qualification contains `manifest.json`, `summary.json`, replay input,
+  canonical decisions, three separate process outputs, and `SHA256SUMS`.
+- P5 qualification contains `walkthrough.json`, deterministic SLO rule
+  evidence and logs, and `SHA256SUMS`.
 
-Not every artifact applies to every run. Missing required artifacts invalidate
-a scored result.
+The exact commands, resume behavior, and required files are documented in
+[`results/README.md`](../results/README.md). Missing required artifacts,
+non-final manifests, checksum failures, skipped live P5 alerts, or invalid
+reconciliation invalidate a scored result.
 
 Random seeds, exact action traces, and failure output are always preserved.
 Tests use predicate polling with deadlines, never fixed readiness sleeps. A

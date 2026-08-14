@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rajeev-chaurasia/rail-yard/internal/api"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	storepkg "github.com/rajeev-chaurasia/rail-yard/internal/store"
 )
@@ -68,11 +69,28 @@ func (s *Store) RedriveDeadLetter(
 	requestDigest string,
 	now time.Time,
 ) (domain.Job, bool, error) {
-	s.redriveMu.Lock()
-	defer s.redriveMu.Unlock()
+	releaseWrite := s.beginWrite(writeNormal)
+	defer releaseWrite()
+	now = s.writeTime(now)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("begin dead-letter redrive: %w", err)
+	}
+	defer rollback(tx)
 
+	original, err := scanJob(tx.QueryRowContext(
+		ctx,
+		"SELECT "+jobColumns+" FROM jobs WHERE id = ?",
+		jobID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Job{}, false, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Job{}, false, fmt.Errorf("read redrive source: %w", err)
+	}
 	var redrivenJobID sql.NullString
-	err := s.db.QueryRowContext(
+	err = tx.QueryRowContext(
 		ctx,
 		"SELECT redriven_job_id FROM dead_letters WHERE job_id = ?",
 		jobID,
@@ -83,29 +101,36 @@ func (s *Store) RedriveDeadLetter(
 	if err != nil {
 		return domain.Job{}, false, fmt.Errorf("read dead letter: %w", err)
 	}
+	const actionName = "dead_letter.redrive"
+	stored, duplicate, err := readControlAction(
+		ctx,
+		tx,
+		original.TenantID,
+		idempotencyKey,
+		actionName,
+		requestDigest,
+	)
+	if err != nil {
+		return domain.Job{}, false, err
+	}
+	if duplicate {
+		var response api.RedriveDeadLetterResponse
+		if err := json.Unmarshal([]byte(stored), &response); err != nil {
+			return domain.Job{}, false, fmt.Errorf("decode redrive response: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.Job{}, false, fmt.Errorf("commit duplicate redrive: %w", err)
+		}
+		return response.Job, true, nil
+	}
 	if redrivenJobID.Valid {
 		return domain.Job{}, false, domain.ErrDeadLetterRedriven
 	}
-	original, err := s.GetJob(ctx, jobID)
+	created, err := cloneJob(ctx, tx, s, original, now)
 	if err != nil {
 		return domain.Job{}, false, err
 	}
-	created, duplicate, err := s.SubmitJob(ctx, storepkg.Submission{
-		Job: domain.JobSpec{
-			TenantID: original.TenantID,
-			Queue:    original.Queue,
-			Priority: original.Priority,
-			SlotCost: original.SlotCost,
-			Payload:  original.Payload,
-			Retry:    original.Retry,
-		},
-		IdempotencyKey: idempotencyKey,
-		RequestDigest:  requestDigest,
-	}, now)
-	if err != nil {
-		return domain.Job{}, false, err
-	}
-	result, err := s.db.ExecContext(
+	result, err := tx.ExecContext(
 		ctx,
 		`UPDATE dead_letters
 		 SET redriven_job_id = ?
@@ -123,7 +148,39 @@ func (s *Store) RedriveDeadLetter(
 	if affected != 1 {
 		return domain.Job{}, false, domain.ErrDeadLetterRedriven
 	}
-	return created, duplicate, nil
+	if err := appendEvent(
+		ctx,
+		tx,
+		jobID,
+		"operator_redrive",
+		original.State,
+		original.StateVersion,
+		now,
+		map[string]any{"actor": "api", "created_job_id": created.ID},
+	); err != nil {
+		return domain.Job{}, false, err
+	}
+	response := api.RedriveDeadLetterResponse{Job: created}
+	if err := insertControlAction(ctx, tx, ControlAction{
+		TenantID:       original.TenantID,
+		IdempotencyKey: idempotencyKey,
+		Action:         actionName,
+		Actor:          "api",
+		RequestDigest:  requestDigest,
+		CommittedAt:    now,
+		TargetType:     "dead_letter",
+		TargetID:       jobID,
+		TargetState:    created.State,
+		TargetVersion:  created.StateVersion,
+		Response:       response,
+		Details:        map[string]string{"created_job_id": created.ID},
+	}); err != nil {
+		return domain.Job{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Job{}, false, fmt.Errorf("commit dead-letter redrive: %w", err)
+	}
+	return created, false, nil
 }
 
 var _ storepkg.DeadLetterStore = (*Store)(nil)

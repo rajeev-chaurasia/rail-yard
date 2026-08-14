@@ -251,6 +251,34 @@ func (c *Client) AlertState(ctx context.Context, name string) (string, error) {
 	return "inactive", nil
 }
 
+func (c *Client) AlertRules(ctx context.Context) (map[string]bool, error) {
+	var response prometheusRulesResponse
+	err := c.doJSON(
+		ctx,
+		http.MethodGet,
+		c.prometheusURL+"/api/v1/rules?type=alert",
+		"",
+		nil,
+		&response,
+		http.StatusOK,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if response.Status != "success" {
+		return nil, fmt.Errorf("prometheus rules API status is %q", response.Status)
+	}
+	rules := make(map[string]bool)
+	for _, group := range response.Data.Groups {
+		for _, rule := range group.Rules {
+			if rule.Type == "alerting" {
+				rules[rule.Name] = true
+			}
+		}
+	}
+	return rules, nil
+}
+
 func (c *Client) doControlJSON(
 	ctx context.Context,
 	method string,

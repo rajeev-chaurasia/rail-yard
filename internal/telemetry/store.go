@@ -8,6 +8,7 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/internal/api"
 	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/store"
+	"github.com/rajeev-chaurasia/rail-yard/internal/trigger"
 )
 
 type ObservedStore struct {
@@ -47,6 +48,23 @@ func (s *ObservedStore) GetJob(ctx context.Context, jobID string) (domain.Job, e
 	return s.next.GetJob(ctx, jobID)
 }
 
+func (s *ObservedStore) RegisterWorker(
+	ctx context.Context,
+	workerID string,
+	capacitySlots int,
+	now time.Time,
+) error {
+	return s.next.RegisterWorker(ctx, workerID, capacitySlots, now)
+}
+
+func (s *ObservedStore) HeartbeatWorker(
+	ctx context.Context,
+	workerID string,
+	now time.Time,
+) error {
+	return s.next.HeartbeatWorker(ctx, workerID, now)
+}
+
 func (s *ObservedStore) Acquire(
 	ctx context.Context,
 	workerID string,
@@ -62,11 +80,10 @@ func (s *ObservedStore) Acquire(
 	case err != nil:
 		s.metrics.RecordSchedulerDecision(SchedulerFailed, 0)
 	case len(leases) == 0:
-		s.metrics.RecordSchedulerDecision(SchedulerQueueEmpty, 0)
+		s.metrics.RecordSchedulerDecision(SchedulerNoGrant, 0)
 	default:
 		s.metrics.RecordSchedulerDecision(SchedulerGranted, len(leases))
 	}
-	s.recordLeaseLatency(leases, now)
 	return leases, err
 }
 
@@ -98,11 +115,10 @@ func (s *ObservedStore) AcquireWithRecoveryReserve(
 	case err != nil:
 		s.metrics.RecordSchedulerDecision(SchedulerFailed, 0)
 	case len(leases) == 0:
-		s.metrics.RecordSchedulerDecision(SchedulerQueueEmpty, 0)
+		s.metrics.RecordSchedulerDecision(SchedulerNoGrant, 0)
 	default:
 		s.metrics.RecordSchedulerDecision(SchedulerGranted, len(leases))
 	}
-	s.recordLeaseLatency(leases, now)
 	return leases, err
 }
 
@@ -210,19 +226,14 @@ func (s *ObservedStore) ReapExpired(
 	values, err := s.next.ReapExpired(ctx, now, limit)
 	s.observeSQLite(SQLiteReapExpired, started, err)
 	if err == nil {
-		deadLettered := false
 		for _, value := range values {
 			if value.NextAvailableAt.IsZero() {
-				deadLettered = true
 				s.metrics.RecordLeaseExpiration(LeaseDeadLettered)
 				s.metrics.RecordDeadLetter(DeadLetterRetriesExhausted)
 			} else {
 				s.metrics.RecordLeaseExpiration(LeaseRequeued)
 				s.metrics.RecordRetry(RetryLeaseExpired)
 			}
-		}
-		if deadLettered {
-			_ = s.RefreshDLQDepth(ctx)
 		}
 	}
 	return values, err
@@ -255,43 +266,33 @@ func (s *ObservedStore) RedriveDeadLetter(
 		return domain.Job{}, false, errors.New("dead-letter storage is not supported")
 	}
 	job, duplicate, err := next.RedriveDeadLetter(ctx, jobID, key, digest, now)
-	if err == nil {
-		_ = s.RefreshDLQDepth(ctx)
-	}
 	return job, duplicate, err
 }
 
-func (s *ObservedStore) RefreshDLQDepth(ctx context.Context) error {
-	next, ok := s.next.(store.DeadLetterStore)
+func (s *ObservedStore) DeliverRedis(
+	ctx context.Context,
+	delivery trigger.RedisDelivery,
+) error {
+	next, ok := s.next.(trigger.RedisSink)
 	if !ok {
-		return errors.New("dead-letter storage is not supported")
+		return errors.New("redis delivery storage is not supported")
 	}
-	values, err := next.ListDeadLetters(ctx, 100_000)
-	if err != nil {
-		return err
-	}
-	s.metrics.SetDLQDepth(len(values))
-	return nil
+	started := time.Now()
+	err := next.DeliverRedis(ctx, delivery)
+	s.observeSQLite(SQLiteRedisIngest, started, err)
+	return err
 }
 
 func (s *ObservedStore) observeSQLite(operation SQLiteOperation, started time.Time, err error) {
-	result := SQLiteSuccess
-	if err != nil {
-		result = SQLiteError
+	result := sqliteResult(err)
+	if result == SQLiteBusy {
+		s.metrics.RecordSQLiteBusy(operation)
 	}
 	s.metrics.ObserveSQLiteTransaction(operation, result, time.Since(started))
 }
 
-func (s *ObservedStore) recordLeaseLatency(leases []domain.Lease, leasedAt time.Time) {
-	for _, lease := range leases {
-		if !lease.ReadyAt.IsZero() {
-			s.metrics.ObserveJobLatency(JobReadyToLease, leasedAt.Sub(lease.ReadyAt))
-		}
-	}
-}
-
 func (s *ObservedStore) recordCompletionReceipt(
-	ctx context.Context,
+	_ context.Context,
 	receipt domain.CompletionReceipt,
 ) {
 	if receipt.Duplicate {
@@ -308,8 +309,21 @@ func (s *ObservedStore) recordCompletionReceipt(
 	case domain.StateDeadLetter:
 		s.metrics.RecordCompletion(CompletionDeadLetter)
 		s.metrics.RecordDeadLetter(DeadLetterRetriesExhausted)
-		_ = s.RefreshDLQDepth(ctx)
 	}
+}
+
+func sqliteResult(err error) SQLiteResult {
+	if err == nil {
+		return SQLiteSuccess
+	}
+	var sqliteErr interface{ Code() int }
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code() & 0xff {
+		case 5, 6:
+			return SQLiteBusy
+		}
+	}
+	return SQLiteError
 }
 
 func (s *ObservedStore) recordAdmission(duplicate bool, err error) {
@@ -343,3 +357,4 @@ var _ store.BatchAttemptStartStore = (*ObservedStore)(nil)
 var _ store.BatchCompletionStore = (*ObservedStore)(nil)
 var _ store.RecoveryAwareStore = (*ObservedStore)(nil)
 var _ store.DeadLetterStore = (*ObservedStore)(nil)
+var _ trigger.RedisSink = (*ObservedStore)(nil)

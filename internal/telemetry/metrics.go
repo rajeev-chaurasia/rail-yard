@@ -25,8 +25,7 @@ type SchedulerOutcome uint8
 const (
 	SchedulerUnknown SchedulerOutcome = iota
 	SchedulerGranted
-	SchedulerQueueEmpty
-	SchedulerCapacityBlocked
+	SchedulerNoGrant
 	SchedulerFailed
 )
 
@@ -55,12 +54,9 @@ type RejectionReason uint8
 const (
 	RejectionUnknown RejectionReason = iota
 	RejectionQueueFull
-	RejectionInvalidRequest
-	RejectionSlotCost
 	RejectionCycleDetected
 	RejectionIdempotencyConflict
 	RejectionStaleLease
-	RejectionShuttingDown
 	RejectionInternal
 )
 
@@ -85,7 +81,6 @@ type DeadLetterReason uint8
 const (
 	DeadLetterUnknown DeadLetterReason = iota
 	DeadLetterRetriesExhausted
-	DeadLetterUpstreamFailed
 )
 
 type SQLiteOperation uint8
@@ -101,8 +96,6 @@ const (
 	SQLitePromoteDue
 	SQLiteReapExpired
 	SQLiteRedisIngest
-	SQLiteRedisAcknowledge
-	SQLiteCheckpoint
 )
 
 type SQLiteResult uint8
@@ -140,8 +133,8 @@ type Metrics struct {
 	sqliteDuration        *prometheus.HistogramVec
 	sqliteBusy            *prometheus.CounterVec
 	jobLatency            *prometheus.HistogramVec
-	redisStreamLag        prometheus.Gauge
-	redisPendingEntries   prometheus.Gauge
+	redisStreamLag        *prometheus.GaugeVec
+	redisPendingEntries   *prometheus.GaugeVec
 }
 
 func New() (*Metrics, error) {
@@ -207,7 +200,7 @@ func New() (*Metrics, error) {
 		sqliteDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "sqlite_transaction_duration_seconds",
-			Help:      "SQLite transaction latency by bounded operation and result.",
+			Help:      "SQLite-backed store call latency by bounded operation and result.",
 			Buckets: []float64{
 				0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
 				0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
@@ -227,16 +220,16 @@ func New() (*Metrics, error) {
 				2.5, 5, 10, 30, 60, 120, 300,
 			},
 		}, []string{"stage"}),
-		redisStreamLag: prometheus.NewGauge(prometheus.GaugeOpts{
+		redisStreamLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "redis_stream_lag",
 			Help:      "Current aggregate Redis consumer-group stream lag.",
-		}),
-		redisPendingEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, nil),
+		redisPendingEntries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "redis_pending_entries",
 			Help:      "Current aggregate pending Redis stream entries.",
-		}),
+		}, nil),
 	}
 
 	metricCollectors := []prometheus.Collector{
@@ -348,21 +341,28 @@ func (m *Metrics) ObserveJobLatency(stage JobLatencyStage, duration time.Duratio
 }
 
 func (m *Metrics) SetRedisStreamState(lag, pendingEntries int64) {
-	if lag < 0 {
-		lag = 0
+	if lag >= 0 {
+		m.redisStreamLag.WithLabelValues().Set(float64(lag))
+	} else {
+		m.redisStreamLag.DeleteLabelValues()
 	}
-	if pendingEntries < 0 {
-		pendingEntries = 0
+	if pendingEntries >= 0 {
+		m.redisPendingEntries.WithLabelValues().Set(float64(pendingEntries))
+	} else {
+		m.redisPendingEntries.DeleteLabelValues()
 	}
-	m.redisStreamLag.Set(float64(lag))
-	m.redisPendingEntries.Set(float64(pendingEntries))
+}
+
+func (m *Metrics) ClearRedisStreamState() {
+	m.redisStreamLag.DeleteLabelValues()
+	m.redisPendingEntries.DeleteLabelValues()
 }
 
 func (m *Metrics) initializeBoundedSeries() {
 	for _, label := range []string{"accepted", "duplicate", "other"} {
 		m.admissions.WithLabelValues(label)
 	}
-	for _, label := range []string{"granted", "queue_empty", "capacity_blocked", "failed", "other"} {
+	for _, label := range []string{"granted", "no_grant", "failed", "other"} {
 		m.schedulerDecisions.WithLabelValues(label)
 	}
 	for _, label := range []string{"succeeded", "failed", "retrying", "dead_letter", "other"} {
@@ -373,12 +373,9 @@ func (m *Metrics) initializeBoundedSeries() {
 	}
 	for _, label := range []string{
 		"queue_full",
-		"invalid_request",
-		"slot_cost",
 		"cycle_detected",
 		"idempotency_conflict",
 		"stale_lease",
-		"shutting_down",
 		"internal",
 		"other",
 	} {
@@ -390,7 +387,7 @@ func (m *Metrics) initializeBoundedSeries() {
 	for _, label := range []string{"attempt_failure", "lease_expired", "other"} {
 		m.retries.WithLabelValues(label)
 	}
-	for _, label := range []string{"retries_exhausted", "upstream_failed", "other"} {
+	for _, label := range []string{"retries_exhausted", "other"} {
 		m.deadLetters.WithLabelValues(label)
 	}
 
@@ -404,8 +401,6 @@ func (m *Metrics) initializeBoundedSeries() {
 		"promote_due",
 		"reap_expired",
 		"redis_ingest",
-		"redis_acknowledge",
-		"checkpoint",
 		"other",
 	}
 	for _, operation := range operations {
@@ -439,10 +434,8 @@ func schedulerLabel(outcome SchedulerOutcome) string {
 	switch outcome {
 	case SchedulerGranted:
 		return "granted"
-	case SchedulerQueueEmpty:
-		return "queue_empty"
-	case SchedulerCapacityBlocked:
-		return "capacity_blocked"
+	case SchedulerNoGrant:
+		return "no_grant"
 	case SchedulerFailed:
 		return "failed"
 	default:
@@ -484,18 +477,12 @@ func rejectionLabel(reason RejectionReason) string {
 	switch reason {
 	case RejectionQueueFull:
 		return "queue_full"
-	case RejectionInvalidRequest:
-		return "invalid_request"
-	case RejectionSlotCost:
-		return "slot_cost"
 	case RejectionCycleDetected:
 		return "cycle_detected"
 	case RejectionIdempotencyConflict:
 		return "idempotency_conflict"
 	case RejectionStaleLease:
 		return "stale_lease"
-	case RejectionShuttingDown:
-		return "shutting_down"
 	case RejectionInternal:
 		return "internal"
 	default:
@@ -529,8 +516,6 @@ func deadLetterLabel(reason DeadLetterReason) string {
 	switch reason {
 	case DeadLetterRetriesExhausted:
 		return "retries_exhausted"
-	case DeadLetterUpstreamFailed:
-		return "upstream_failed"
 	default:
 		return "other"
 	}
@@ -556,10 +541,6 @@ func sqliteOperationLabel(operation SQLiteOperation) string {
 		return "reap_expired"
 	case SQLiteRedisIngest:
 		return "redis_ingest"
-	case SQLiteRedisAcknowledge:
-		return "redis_acknowledge"
-	case SQLiteCheckpoint:
-		return "checkpoint"
 	default:
 		return "other"
 	}

@@ -26,7 +26,6 @@ func TestOperationsWalkthrough(t *testing.T) {
 	)
 	config.ComposeFile = envOrDefault("RAILYARD_P5_COMPOSE_FILE", config.ComposeFile)
 	config.ComposeProject = envOrDefault("RAILYARD_P5_COMPOSE_PROJECT", config.ComposeProject)
-	config.SkipLiveAlerts = os.Getenv("RAILYARD_P5_SKIP_LIVE_ALERTS") == "1"
 
 	runner, err := NewRunner(config, t.Logf)
 	if err != nil {
@@ -41,8 +40,16 @@ func TestOperationsWalkthrough(t *testing.T) {
 	if report.CompletedAt.IsZero() {
 		t.Fatal("walkthrough returned without a completion timestamp")
 	}
-	if report.AuditEventCount < 11 {
-		t.Fatalf("audit event count = %d, want at least 11", report.AuditEventCount)
+	minimumAuditEvents := 0
+	for _, count := range requiredAuditCounts() {
+		minimumAuditEvents += count
+	}
+	if report.AuditEventCount < minimumAuditEvents {
+		t.Fatalf(
+			"audit event count = %d, want at least %d",
+			report.AuditEventCount,
+			minimumAuditEvents,
+		)
 	}
 }
 

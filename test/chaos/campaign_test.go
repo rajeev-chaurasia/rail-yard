@@ -78,8 +78,9 @@ func TestSubmitAllRecordsExactlyOneReceiptPerJob(t *testing.T) {
 		response.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprintf(
 			response,
-			`{"job":{"id":"%032x"},"duplicate":false}`,
+			`{"job":{"id":"%032x","created_at":"%s"},"duplicate":false}`,
 			index,
+			time.Now().UTC().Format(time.RFC3339Nano),
 		)
 	}))
 	defer server.Close()
@@ -103,6 +104,7 @@ func TestSubmitAllRecordsExactlyOneReceiptPerJob(t *testing.T) {
 	cfg.RequestTimeout = time.Second
 	released := make(chan struct{})
 	close(released)
+	calibrator := &clockCalibrator{}
 	if err := submitAll(
 		context.Background(),
 		cfg,
@@ -113,6 +115,7 @@ func TestSubmitAllRecordsExactlyOneReceiptPerJob(t *testing.T) {
 		6,
 		released,
 		recorder,
+		calibrator,
 	); err != nil {
 		t.Fatalf("submit all: %v", err)
 	}
@@ -121,6 +124,9 @@ func TestSubmitAllRecordsExactlyOneReceiptPerJob(t *testing.T) {
 	}
 	if accepted.Load() != int64(cfg.Jobs) {
 		t.Fatalf("accepted=%d want=%d", accepted.Load(), cfg.Jobs)
+	}
+	if _, exists := calibrator.current(); !exists {
+		t.Fatal("submission did not persist a server clock mapping")
 	}
 
 	file, err := os.Open(path)
@@ -178,6 +184,144 @@ func TestNearestRankP99(t *testing.T) {
 	}
 	if got := nearestRankP99(samples); got != 99 {
 		t.Fatalf("p99=%v want=99", got)
+	}
+}
+
+func TestKilledLeaseSelectionSurvivesReaperAndCompletionRace(t *testing.T) {
+	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	snapshot := []activeLease{
+		{JobID: "reaped", AttemptNo: 1, Generation: 11},
+		{JobID: "finished", AttemptNo: 1, Generation: 12},
+		{JobID: "active", AttemptNo: 2, Generation: 13},
+	}
+	states := []leaseBoundaryState{
+		{
+			JobID:       "reaped",
+			AttemptNo:   1,
+			Generation:  11,
+			State:       "EXPIRED",
+			CompletedAt: killTime.Add(6 * time.Millisecond),
+		},
+		{
+			JobID:       "finished",
+			AttemptNo:   1,
+			Generation:  12,
+			State:       "SUCCEEDED",
+			CompletedAt: killTime.Add(-6 * time.Millisecond),
+		},
+		{
+			JobID:      "active",
+			AttemptNo:  2,
+			Generation: 13,
+			State:      "RUNNING",
+		},
+	}
+	affected, err := selectKilledLeases(snapshot, states, killTime, 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("select killed leases: %v", err)
+	}
+	want := []activeLease{snapshot[0], snapshot[2]}
+	if !reflect.DeepEqual(affected, want) {
+		t.Fatalf("affected leases=%#v want=%#v", affected, want)
+	}
+}
+
+func TestKilledLeaseSelectionFailsOnBoundaryUncertainty(t *testing.T) {
+	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	snapshot := []activeLease{{JobID: "ambiguous", AttemptNo: 1, Generation: 1}}
+	states := []leaseBoundaryState{{
+		JobID:       "ambiguous",
+		AttemptNo:   1,
+		Generation:  1,
+		State:       "SUCCEEDED",
+		CompletedAt: killTime.Add(2 * time.Millisecond),
+	}}
+	if _, err := selectKilledLeases(snapshot, states, killTime, 5*time.Millisecond); err == nil {
+		t.Fatal("completion inside the uncertain kill boundary was scored")
+	}
+}
+
+func TestClockMappingFailsOnExcessiveUncertainty(t *testing.T) {
+	hostTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	mapping, err := newClockMapping(
+		hostTime.Add(time.Second),
+		hostTime,
+		hostTime.Add(2*maxClockMappingUncertainty+time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("create clock mapping: %v", err)
+	}
+	calibrator := &clockCalibrator{}
+	calibrator.record(mapping)
+	cfg := validConfig()
+	if _, err := waitForClockMapping(context.Background(), cfg, calibrator); err == nil {
+		t.Fatal("clock mapping with excessive uncertainty was accepted")
+	}
+}
+
+func TestRecoveryScoringUsesDurableSuccessorLease(t *testing.T) {
+	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	mapping, err := newClockMapping(
+		killTime.Add(-time.Second+5*time.Millisecond),
+		killTime.Add(-time.Second),
+		killTime.Add(-time.Second+10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("create clock mapping: %v", err)
+	}
+	kill := workerKill{
+		Sequence:        1,
+		Worker:          "worker-1",
+		ContainerID:     "container-1",
+		ConfirmedHostAt: killTime,
+		ConfirmedAt:     killTime,
+		ClockMapping:    mapping,
+		Leases: []activeLease{{
+			JobID:      "job-1",
+			AttemptNo:  1,
+			Generation: 1,
+		}},
+		RecoveredAt: map[string]time.Time{"job-1": killTime.Add(9 * time.Second)},
+	}
+	attempts := map[string][]databaseAttempt{
+		"job-1": {
+			{
+				JobID:        "job-1",
+				AttemptNo:    2,
+				Generation:   2,
+				LeasedAt:     killTime.Add(2 * time.Second),
+				CompletionAt: killTime.Add(3 * time.Second),
+			},
+		},
+	}
+	samples, err := scoreRecoverySamples([]workerKill{kill}, attempts)
+	if err != nil {
+		t.Fatalf("score recovery: %v", err)
+	}
+	if len(samples) != 1 || samples[0].RecoveryMS != 2000 {
+		t.Fatalf("recovery samples=%#v", samples)
+	}
+	if samples[0].SuccessorObservedAt.Equal(samples[0].SuccessorLeasedAt) {
+		t.Fatal("test did not distinguish durable lease time from host observation")
+	}
+}
+
+func TestRecoveryScoringFailsWithoutSuccessor(t *testing.T) {
+	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	mapping, err := newClockMapping(killTime, killTime, killTime)
+	if err != nil {
+		t.Fatalf("create clock mapping: %v", err)
+	}
+	kill := workerKill{
+		Sequence:        1,
+		ConfirmedHostAt: killTime,
+		ConfirmedAt:     killTime,
+		ClockMapping:    mapping,
+		Leases:          []activeLease{{JobID: "job-1", AttemptNo: 1, Generation: 1}},
+		RecoveredAt:     map[string]time.Time{"job-1": killTime.Add(time.Second)},
+	}
+	if _, err := scoreRecoverySamples([]workerKill{kill}, nil); err == nil {
+		t.Fatal("affected lease without a durable successor was scored")
 	}
 }
 

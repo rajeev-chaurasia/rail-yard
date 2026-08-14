@@ -125,7 +125,8 @@ Alertmanager in this local deployment.
 ## Admission overload
 
 Symptoms include HTTP `429` with code `queue_full`, increasing pending depth,
-and `RailYardAdmissionOverload`.
+and a sustained queue-full rejection rate. There is no separate admission
+overload alert in the committed rules.
 
 Capture the current rates before changing capacity:
 
@@ -163,8 +164,9 @@ decision.
 
 ## Lease expiry storm
 
-Symptoms are `RailYardLeaseStorm`, repeated worker registration, falling
-completion throughput, or recovery p99 approaching five seconds.
+Symptoms are repeated worker registration, rising lease-expiration rate,
+falling completion throughput, or recovery p99 approaching five seconds. There
+is no separate lease-storm alert in the committed rules.
 
 ```sh
 curl -fsSG http://127.0.0.1:9090/api/v1/query \
@@ -418,7 +420,12 @@ Create `telemetry.Metrics` once with `telemetry.New`, route
 Prometheus default registry. Record counters only after the corresponding
 durable transaction commits. Idempotent duplicates increment the duplicate
 admission series but must not increment durable grants or completion outcomes.
-Refresh queue gauges from an aggregate post-commit snapshot. Observe job and
-recovery latency from persisted timestamps so process restarts do not reset the
-measurement origin. Poll configured Redis groups and publish their aggregate
-lag and pending counts through `SetRedisStreamState`.
+Refresh queue and dead-letter gauges every five seconds from aggregate SQLite
+queries. Start the lifecycle event cursor at the current durable sequence, then
+consume new events incrementally. Events committed after startup use persisted
+ready, lease, completion, and lease-loss timestamps even when their origin
+predates the process. Historical observations are not replayed after a restart.
+SQLite latency and busy outcomes cover instrumented job-protocol storage calls.
+Poll the configured Redis group every five seconds; publish pending entries and
+lag only when Redis reports them, and remove the series when the group state
+cannot be observed.
