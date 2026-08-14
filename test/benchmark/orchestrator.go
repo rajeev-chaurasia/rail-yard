@@ -726,11 +726,18 @@ func captureEnvironment(
 }
 
 func requireQualificationEnvironment(environment evidence.EnvironmentManifest) error {
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("qualification requires a Linux host, got %s", runtime.GOOS)
+	if environment.GitDirty == nil || *environment.GitDirty {
+		return errors.New("qualification requires a clean Git worktree")
 	}
-	if len(environment.Unavailable) != 0 {
-		return fmt.Errorf("qualification environment evidence is unavailable: %v", environment.Unavailable)
+	for name, value := range map[string]string{
+		"git_commit":      environment.GitCommit,
+		"docker_version":  environment.DockerVersion,
+		"compose_version": environment.ComposeVersion,
+		"filesystem":      environment.Filesystem,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("qualification requires %s evidence", name)
+		}
 	}
 	if len(environment.BinaryDigests) < 2 {
 		return errors.New("qualification requires server and worker binary digests")

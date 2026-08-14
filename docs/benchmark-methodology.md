@@ -2,7 +2,7 @@
 
 ## Canonical environment
 
-Qualification runs use the committed Docker Compose topology on a single Linux
+Qualification runs use the committed Docker Compose Linux topology on a single
 host:
 
 - one `railyard-server`;
