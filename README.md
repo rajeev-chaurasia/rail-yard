@@ -12,10 +12,12 @@ evidence. Resume material will use only measured results.
 ## Status
 
 - [x] Architecture and acceptance targets defined
-- [ ] Durable state machine, worker protocol, and leases
-- [ ] DAG scheduler, triggers, retries, and dead-letter queue
-- [ ] Chaos campaign and deterministic replay
+- [x] Durable state machine, worker protocol, and leases
+- [x] DAG scheduler, triggers, retries, and dead-letter queue
+- [x] Deterministic replay harness
+- [ ] Full chaos qualification campaign
 - [ ] Benchmarks, dashboard, runbook, and measured results
+- [x] Operations API, internal dashboard, audit trail, and SLO evidence
 
 ## Correctness contract
 
@@ -58,7 +60,7 @@ The control plane owns all durable state.
 - SQLite runs in WAL mode with full synchronous durability. Sequence-ordered
   transactional writes prevent a restart from resurrecting settled state.
 - Workers hold fenced leases, heartbeat every second, and lose ownership when a
-  three-second lease expires.
+  2.5-second lease expires.
 - Triggers come from upstream DAG completion, durable cron occurrences, and a
   Redis Streams consumer group.
 - Retries use bounded exponential backoff around 2 s, 4 s, 8 s, and 16 s with
@@ -109,12 +111,13 @@ The server exposes bounded-cardinality Prometheus metrics for:
 - SQLite transaction latency and busy time; and
 - end-to-end job latency.
 
-A provisioned Grafana dashboard and an operator runbook will ship with the
-reference Docker Compose environment.
+The reference Docker Compose environment includes the provisioned
+[Grafana dashboard](deploy/grafana/dashboards/railyard-overview.json),
+[operator runbook](docs/runbook.md), and [SLO alert guide](docs/ALERTS.md).
 
 ## Milestones
 
-### P1 — durable execution
+### P1: durable execution
 
 Implement the state machine, SQLite persistence, one worker, fenced leases,
 heartbeats, and the reaper.
@@ -122,14 +125,14 @@ heartbeats, and the reaper.
 Gate: kill a worker during a no-op job, reassign the job within five seconds,
 and commit exactly one terminal ledger outcome.
 
-### P2 — orchestration features
+### P2: orchestration features
 
 Add DAG dependencies, fair priority scheduling, cron and Redis Stream triggers,
 deterministic retry jitter, the dead-letter queue, and admission control.
 
 Gate: deterministic property, race, and Docker integration suites pass.
 
-### P3 — failure evidence
+### P3: failure evidence
 
 Add targeted crash failpoints, a seeded chaos controller, independent ledger
 reconciliation, and deterministic replay.
@@ -137,20 +140,38 @@ reconciliation, and deterministic replay.
 Gate: ten 50,000-job chaos runs reconcile with no lost or duplicate canonical
 terminal outcomes, and three full replays match byte-for-byte.
 
-### P4 — measured operations
+### P4: measured operations
 
 Add transaction batching, benchmark tooling, Prometheus, Grafana, raw result
 artifacts, and the runbook.
 
 Gate: complete all qualification criteria below on the documented host.
 
+### P5: enterprise operations
+
+Add an OpenAPI contract, operator endpoints, a server-rendered dashboard, an
+actor-aware audit trail, and explicit SLO alerting.
+
+- Query job history, queue depth, worker health, lease age, DAG state, and the
+  dead-letter queue.
+- Cancel, redrive, release, fail, or dead-letter work through idempotent
+  actor-attributed operations.
+- Operate the same lifecycle through a plain Go template and vanilla
+  JavaScript dashboard under `/ops/`.
+- Alert when fewer than 99% of ready jobs start within five seconds or when the
+  dead-letter queue exceeds its documented threshold.
+
+Gate: complete a recorded DAG lifecycle through the API and dashboard, then
+prove both SLO alerts fire and recover under deliberate breaches.
+
 ## Qualification targets
 
 These are acceptance targets, not achieved results:
 
 1. **Throughput:** three-run median of at least 10,000 durable no-op scheduling
-   decisions per minute on one host with eight worker processes. Every run must
-   also reconcile all accepted jobs to successful terminal outcomes.
+   decisions per minute on one host with eight worker processes at 256 slots
+   each. Every run must also reconcile all accepted jobs to successful terminal
+   outcomes.
 2. **Chaos correctness:** ten seeded runs of 50,000 accepted jobs, with random
    worker kills and one server kill per run, produce zero lost and zero
    duplicate canonical terminal outcomes.
@@ -158,6 +179,11 @@ These are acceptance targets, not achieved results:
    seconds at p99 across the chaos campaign, using one-second heartbeats.
 4. **Determinism:** three fresh-process replays reproduce 100% of canonical
    scheduling decisions byte-identically.
+5. **Operations lifecycle:** submit a DAG, observe execution, kill a worker,
+   observe reassignment, force a failure into the dead-letter queue, and
+   redrive it through the API and dashboard with a complete actor audit trail.
+6. **SLO validation:** both committed SLO alerts fire and recover in
+   deterministic rule tests and an integration walkthrough.
 
 Raw manifests, seeds, action traces, reconciliation reports, samples, replay
 digests, and checksums will be committed under `results/`. If a result misses a
@@ -169,10 +195,20 @@ target, the measured number will be published unchanged.
 - `modernc.org/sqlite` with SQLite WAL
 - `github.com/redis/go-redis/v9` and Redis Streams
 - `github.com/prometheus/client_golang` and Grafana
+- OpenAPI 3.1, Go `html/template`, and vanilla JavaScript operations tooling
 - Docker Compose for the canonical Linux environment
 - GitHub Actions for lint, unit, race, integration, replay, and chaos checks
 
 The system is designed to run locally without cloud spend.
+
+## Project references
+
+- [System design](docs/design.md)
+- [Correctness invariants](docs/invariants.md)
+- [OpenAPI contract](api/openapi.yaml)
+- [Benchmark methodology](docs/benchmark-methodology.md)
+- [Operations walkthrough](docs/operations-walkthrough.md)
+- [Evidence directory](results/README.md)
 
 ## Resume activation
 

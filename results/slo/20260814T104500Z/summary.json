@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-14T10:45:00Z",
+  "rules_file": "deploy/prometheus/alerts.yml",
+  "tests_file": "deploy/prometheus/slo-tests.yml",
+  "recording_rules": 3,
+  "alerts": 2,
+  "fire_and_recovery_cases": 2,
+  "command": "promtool check rules deploy/prometheus/alerts.yml && promtool test rules deploy/prometheus/slo-tests.yml",
+  "passed": true
+}

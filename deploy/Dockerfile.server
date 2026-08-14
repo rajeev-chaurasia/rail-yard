@@ -1,0 +1,34 @@
+ARG GO_IMAGE=golang:1.26.6-alpine
+ARG RUNTIME_IMAGE=alpine:3.22
+
+FROM ${GO_IMAGE} AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build \
+    -mod=readonly \
+    -trimpath \
+    -buildvcs=false \
+    -ldflags="-s -w" \
+    -o /out/railyard-server \
+    ./cmd/railyard-server
+
+FROM ${RUNTIME_IMAGE}
+RUN apk add --no-cache ca-certificates sqlite \
+    && addgroup -S -g 10001 railyard \
+    && adduser -S -D -H -u 10001 -G railyard railyard \
+    && install -d -o railyard -g railyard /var/lib/railyard \
+    && install -d -o railyard -g railyard /var/lib/railyard/backups
+
+COPY --from=build --chown=railyard:railyard \
+    /out/railyard-server \
+    /usr/local/bin/railyard-server
+
+USER railyard:railyard
+WORKDIR /var/lib/railyard
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/railyard-server"]

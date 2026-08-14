@@ -1,0 +1,63 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: ready-start alert fires after for duration and recovers
+    interval: 1m
+    input_series:
+      - series: 'railyard_job_latency_seconds_bucket{stage="ready_to_lease",le="5"}'
+        values: '0 98+0x35'
+      - series: 'railyard_job_latency_seconds_count{stage="ready_to_lease"}'
+        values: '0 100+0x35'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RailYardReadyStartSLOBreach
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RailYardReadyStartSLOBreach
+        exp_alerts:
+          - exp_labels:
+              service: railyard
+              severity: critical
+              slo: ready-job-start-latency
+              team: sre
+            exp_annotations:
+              summary: Ready-job start success is below 99 percent
+              description: The 30-minute ready-to-lease ratio has remained below 99 percent for five minutes.
+              runbook_url: https://github.com/rajeev-chaurasia/rail-yard/blob/main/docs/ALERTS.md#slo-1-ready-job-start-latency
+      - eval_time: 32m
+        alertname: RailYardReadyStartSLOBreach
+        exp_alerts: []
+    promql_expr_test:
+      - expr: railyard:slo:ready_start:ratio30m
+        eval_time: 6m
+        exp_samples:
+          - labels: 'railyard:slo:ready_start:ratio30m'
+            value: 0.98
+
+  - name: DLQ depth alert fires after for duration and recovers
+    interval: 1m
+    input_series:
+      - series: 'railyard_dlq_depth'
+        values: '0 10+0x20 0+0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RailYardDLQDepthHigh
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: RailYardDLQDepthHigh
+        exp_alerts:
+          - exp_labels:
+              service: railyard
+              severity: warning
+              slo: dlq-depth
+              team: sre
+            exp_annotations:
+              summary: Dead-letter depth reached 10 entries
+              description: At least 10 jobs have remained in the dead-letter queue for ten minutes.
+              runbook_url: https://github.com/rajeev-chaurasia/rail-yard/blob/main/docs/ALERTS.md#slo-2-dead-letter-queue-depth
+      - eval_time: 32m
+        alertname: RailYardDLQDepthHigh
+        exp_alerts: []

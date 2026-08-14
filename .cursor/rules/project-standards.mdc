@@ -1,0 +1,16 @@
+---
+description: Rail Yard engineering and writing standards
+alwaysApply: true
+---
+
+# Project Standards
+
+- Do not include tooling attribution in commits, source, documentation, pull requests, or release notes.
+- Use direct, natural engineering language. Avoid promotional or formulaic wording.
+- Do not use em dashes. Use commas, periods, colons, or parentheses.
+- Keep comments concise and limited to non-obvious constraints or decisions.
+- Follow SOLID, DRY, and YAGNI. Prefer small interfaces, focused packages, and explicit dependencies.
+- Keep production code modular, testable, and extensible without speculative abstractions.
+- Remove unused imports, dead code, placeholders, and unimplemented stubs.
+- Run formatting, tests, vet, and lint before shipping changes.
+- Use concise commit messages that explain the reason for the change.

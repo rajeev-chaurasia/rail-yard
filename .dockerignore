@@ -1,0 +1,9 @@
+.git
+.cursor
+bin
+coverage
+data
+results
+*.db
+*.db-shm
+*.db-wal

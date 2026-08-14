@@ -1,0 +1,199 @@
+name: Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Qualification suite to run
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - chaos
+          - benchmark
+          - p5
+      seed:
+        description: Deterministic base seed for the chaos campaign
+        required: true
+        type: string
+        default: "26081401"
+      confirmation:
+        description: Type QUALIFY to start the dedicated-host workload
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualification-${{ github.ref }}-${{ inputs.suite }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.6"
+  GO_IMAGE: golang:1.26.6-alpine
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  validate:
+    name: Validate request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm qualification run
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [[ "$CONFIRMATION" != "QUALIFY" ]]; then
+            echo "confirmation must be exactly QUALIFY" >&2
+            exit 1
+          fi
+
+  chaos:
+    name: Full 10 x 50k chaos
+    if: ${{ inputs.suite == 'all' || inputs.suite == 'chaos' }}
+    needs: validate
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - rail-yard-qualification
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run qualification chaos campaign
+        env:
+          CHAOS_SEED: ${{ inputs.seed }}
+        run: >-
+          go run ./hack/ci compose-chaos
+          --project-prefix=rail-yard-qualification-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          --runs=10
+          --jobs=50000
+          --worker-kills=20
+          --job-duration=250ms
+          --action-min=100ms
+          --action-max=500ms
+          --seed="$CHAOS_SEED"
+          --output=artifacts/qualification/chaos
+
+      - name: Upload chaos evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/qualification/chaos/
+          if-no-files-found: error
+          retention-days: 30
+
+  benchmark:
+    name: Three-run benchmark
+    if: ${{ inputs.suite == 'all' || inputs.suite == 'benchmark' }}
+    needs: validate
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - rail-yard-qualification
+    timeout-minutes: 240
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run qualification benchmark
+        run: >-
+          go run ./hack/ci compose-benchmark
+          --project-prefix=rail-yard-qualification-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          --runs=3
+          --jobs=50000
+          --workers=8
+          --worker-slots=256
+          --output=artifacts/qualification/benchmark
+
+      - name: Upload benchmark evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/qualification/benchmark/
+          if-no-files-found: error
+          retention-days: 30
+
+  p5:
+    name: Operations lifecycle and SLOs
+    if: ${{ inputs.suite == 'all' || inputs.suite == 'p5' }}
+    needs: validate
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - rail-yard-qualification
+    timeout-minutes: 60
+    env:
+      COMPOSE_PROJECT: rail-yard-p5-${{ github.run_id }}-${{ github.run_attempt }}
+      RAILYARD_HTTP_PORT: "18081"
+      PROMETHEUS_PORT: "19090"
+      GRAFANA_PORT: "13000"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Start control and observability services
+        run: >-
+          docker compose
+          -f deploy/compose.yaml
+          -p "$COMPOSE_PROJECT"
+          up -d --build redis server prometheus grafana
+
+      - name: Run operations walkthrough
+        run: >-
+          go run ./test/p5/cmd/walkthrough
+          --base-url=http://127.0.0.1:18081
+          --prometheus-url=http://127.0.0.1:19090
+          --actor=qualification
+          --run-id=${{ github.run_id }}-${{ github.run_attempt }}
+          --compose-file=deploy/compose.yaml
+          --compose-project="$COMPOSE_PROJECT"
+          --skip-live-alerts
+          --output=artifacts/qualification/p5/walkthrough.json
+
+      - name: Stop P5 stack
+        if: ${{ always() }}
+        run: >-
+          docker compose
+          -f deploy/compose.yaml
+          -p "$COMPOSE_PROJECT"
+          down -v --remove-orphans
+
+      - name: Upload P5 evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-p5-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/qualification/p5/
+          if-no-files-found: error
+          retention-days: 30

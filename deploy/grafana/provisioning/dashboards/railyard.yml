@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: Rail Yard
+    orgId: 1
+    folder: Rail Yard
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

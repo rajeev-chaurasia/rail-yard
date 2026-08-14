@@ -1,0 +1,1704 @@
+openapi: 3.1.0
+info:
+  title: Rail Yard API
+  version: 1.0.0
+  description: |
+    Rail Yard exposes control-plane, worker, and P5 operations APIs.
+
+    Acceptance and canonical terminal outcomes are durable and idempotent.
+    Payload execution is at least once. A worker can complete an external side
+    effect and lose its lease before reporting completion, so a later attempt
+    can execute the payload again. The lease `idempotency_key` must be honored
+    by external payloads that require idempotent side effects.
+  x-payload-execution-semantics: at-least-once
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+servers:
+  - url: /
+tags:
+  - name: Health
+  - name: Jobs
+  - name: Workflows
+  - name: Dead letters
+  - name: Triggers
+  - name: Workers
+  - name: P5 Operations
+paths:
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Get process liveness
+      responses:
+        "200":
+          description: The process is live.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Get control-plane readiness
+      responses:
+        "200":
+          description: The control plane is ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/jobs:
+    post:
+      tags: [Jobs]
+      operationId: submitJob
+      summary: Submit one logical job
+      description: |
+        The idempotency key is scoped to the normalized job tenant. Reusing the
+        key with the same normalized request returns the original response.
+      x-payload-execution-semantics: at-least-once
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitJobRequest"
+      responses:
+        "201":
+          description: The job was durably accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitJobResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitJobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/jobs/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Get current job state
+      responses:
+        "200":
+          description: Current materialized job state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workflows:
+    post:
+      tags: [Workflows]
+      operationId: submitWorkflow
+      summary: Submit an acyclic workflow
+      description: All workflow jobs and dependency edges are accepted atomically.
+      x-payload-execution-semantics: at-least-once
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitWorkflowRequest"
+      responses:
+        "201":
+          description: The workflow was durably accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitWorkflowResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitWorkflowResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/dead-letters:
+    get:
+      tags: [Dead letters]
+      operationId: listDeadLetters
+      summary: List dead-letter records
+      responses:
+        "200":
+          description: Dead letters ordered by creation time and job ID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeadLetterListResponse"
+        "501":
+          $ref: "#/components/responses/NotSupported"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/dead-letters/{job_id}/redrive:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    post:
+      tags: [Dead letters]
+      operationId: redriveDeadLetter
+      summary: Create a new job from a dead letter
+      description: Redrive creates a new job and never reopens the terminal job.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: A replacement job was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedriveDeadLetterResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedriveDeadLetterResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "501":
+          $ref: "#/components/responses/NotSupported"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/triggers/cron:
+    post:
+      tags: [Triggers]
+      operationId: createCronTrigger
+      summary: Create a cron trigger
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCronTriggerRequest"
+      responses:
+        "201":
+          description: The trigger was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateCronTriggerResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateCronTriggerResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/register:
+    post:
+      tags: [Workers]
+      operationId: registerWorker
+      summary: Register a worker process
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterWorkerRequest"
+      responses:
+        "200":
+          description: Worker registration and lease timing settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterWorkerResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/leases/acquire:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: acquireWorkerLeases
+      summary: Long-poll for fenced leases
+      description: A lease carries the payload execution idempotency key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcquireLeasesRequest"
+      responses:
+        "200":
+          description: Zero or more leases.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcquireLeasesResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/heartbeats:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: heartbeatWorkerLeases
+      summary: Renew active fenced leases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeartbeatRequest"
+      responses:
+        "200":
+          description: Per-lease fencing results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/attempts/start:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: startWorkerAttempt
+      summary: Mark a leased attempt as running
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartAttemptRequest"
+      responses:
+        "204":
+          description: Attempt start accepted.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/attempts/start-batch:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: startWorkerAttemptsBatch
+      summary: Mark a bounded lease batch as running
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartAttemptsRequest"
+      responses:
+        "200":
+          description: Per-lease start results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartAttemptsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/attempts/complete:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: completeWorkerAttempt
+      summary: Complete a fenced attempt
+      description: An identical duplicate returns the original receipt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteAttemptRequest"
+      responses:
+        "200":
+          description: Durable completion receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/workers/{worker_id}/attempts/complete-batch:
+    parameters:
+      - $ref: "#/components/parameters/WorkerID"
+    post:
+      tags: [Workers]
+      operationId: completeWorkerAttemptsBatch
+      summary: Commit a bounded completion batch
+      description: Each result carries either a durable receipt or a stable error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteAttemptsRequest"
+      responses:
+        "200":
+          description: Per-completion results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteAttemptsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/jobs:
+    post:
+      tags: [P5 Operations]
+      operationId: operationsSubmitJob
+      summary: Submit a job through the operations facade
+      description: |
+        This mountable facade uses the same durable, tenant-scoped idempotency
+        semantics as the control API.
+      x-payload-execution-semantics: at-least-once
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitJobRequest"
+      responses:
+        "201":
+          description: The job was durably accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitJobResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitJobResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/dags:
+    post:
+      tags: [P5 Operations]
+      operationId: operationsSubmitDAG
+      summary: Submit a durable DAG
+      description: The DAG, jobs, and immutable edges are accepted atomically.
+      x-payload-execution-semantics: at-least-once
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitWorkflowRequest"
+      responses:
+        "201":
+          description: The DAG was durably accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitDAGResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitDAGResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/jobs/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    get:
+      tags: [P5 Operations]
+      operationId: operationsGetJob
+      summary: Get current job status
+      responses:
+        "200":
+          description: Current materialized job state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/jobs/{job_id}/history:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+      - $ref: "#/components/parameters/HistoryLimit"
+      - $ref: "#/components/parameters/BeforeSequence"
+    get:
+      tags: [P5 Operations]
+      operationId: operationsGetJobHistory
+      summary: Get sequence-ordered job history
+      responses:
+        "200":
+          description: A descending page of durable job events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobHistoryPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/jobs/{job_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    post:
+      tags: [P5 Operations]
+      operationId: operationsCancelJob
+      summary: Cancel a nonterminal job
+      description: |
+        The repository records the actor and reason in the durable history.
+        Cancellation must not reopen or rewrite a terminal outcome.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelJobRequest"
+      responses:
+        "200":
+          description: Durable action receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/dead-letters/{job_id}/redrive:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    post:
+      tags: [P5 Operations]
+      operationId: operationsRedriveDeadLetter
+      summary: Redrive a dead letter as an operator
+      description: A new logical job is created. The terminal source job is unchanged.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
+      responses:
+        "201":
+          description: A replacement job was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedriveDeadLetterResponse"
+        "200":
+          description: The original idempotent response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedriveDeadLetterResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/tenants/{tenant_id}/queues:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+    get:
+      tags: [P5 Operations]
+      operationId: operationsListTenantQueueDepth
+      summary: Get per-queue depth for one tenant
+      responses:
+        "200":
+          description: Queue depth and slot use by queue.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueDepthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/workers:
+    get:
+      tags: [P5 Operations]
+      operationId: operationsListWorkerHealth
+      summary: List worker health and lease age
+      responses:
+        "200":
+          description: Worker heartbeat and active lease age snapshots.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerHealthResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/dags/{dag_id}:
+    parameters:
+      - $ref: "#/components/parameters/DAGID"
+    get:
+      tags: [P5 Operations]
+      operationId: operationsGetDAG
+      summary: Get DAG jobs and immutable edges
+      responses:
+        "200":
+          description: DAG details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DAGDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /v1/operations/jobs/{job_id}/force:
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    post:
+      tags: [P5 Operations]
+      operationId: operationsForceJobAction
+      summary: Apply a fenced operator force action
+      description: |
+        `release` fences the current lease and makes the job eligible for a
+        successor attempt. `fail` and `dead_letter` create one canonical
+        terminal outcome. Implementations must reject stale state and must not
+        mutate an existing terminal outcome.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForceJobRequest"
+      responses:
+        "200":
+          description: Durable action receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Printable ASCII key, at most 256 bytes. The same key and normalized
+        request return the original response. A conflicting request returns
+        `idempotency_conflict`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+        pattern: "^[!-~]+$"
+    Actor:
+      name: X-Rail-Yard-Actor
+      in: header
+      required: true
+      description: |
+        Audited operator identity. This identifies the actor but does not
+        replace authentication or authorization at the deployment boundary.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+        pattern: "^[!-~]+$"
+    JobID:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    WorkerID:
+      name: worker_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_.-]+$"
+    DAGID:
+      name: dag_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    TenantID:
+      name: tenant_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    HistoryLimit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of events in the page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+    BeforeSequence:
+      name: before_seq
+      in: query
+      required: false
+      description: Return events with sequence numbers lower than this value.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Idempotency, fencing, or state conflict.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTooLarge:
+      description: Request body exceeds the configured limit.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    QueueFull:
+      description: Tenant admission depth is full.
+      headers:
+        Retry-After:
+          description: Suggested delay in seconds.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: The service or requested subsystem is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: The operation exceeded its request deadline.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotSupported:
+      description: The configured repository does not support this operation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+    Payload:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [noop, shell]
+        duration_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        args:
+          type: array
+          items:
+            type: string
+      allOf:
+        - if:
+            properties:
+              type:
+                const: shell
+          then:
+            required: [args]
+            properties:
+              args:
+                minItems: 1
+    RetryPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 5
+        retryable:
+          type: boolean
+          default: true
+    JobSpec:
+      type: object
+      additionalProperties: false
+      required: [payload]
+      properties:
+        name:
+          type: string
+        tenant_id:
+          type: string
+          maxLength: 128
+          default: default
+        queue:
+          type: string
+          maxLength: 128
+          default: default
+        priority:
+          type: integer
+          default: 0
+        slot_cost:
+          type: integer
+          minimum: 1
+          default: 1
+        payload:
+          $ref: "#/components/schemas/Payload"
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+        depends_on:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        available_at:
+          type: string
+          format: date-time
+    Failure:
+      type: object
+      additionalProperties: false
+      required: [class, message]
+      properties:
+        class:
+          type: string
+        message:
+          type: string
+        exit_code:
+          type: integer
+        output_digest:
+          type: string
+        stderr:
+          type: string
+    JobState:
+      type: string
+      enum:
+        - PENDING
+        - SCHEDULED
+        - RUNNING
+        - RETRYING
+        - SUCCEEDED
+        - FAILED
+        - DEAD_LETTER
+    Job:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - tenant_id
+        - queue
+        - priority
+        - slot_cost
+        - payload
+        - retry
+        - state
+        - attempt_no
+        - state_version
+        - lease_generation
+        - available_at
+        - ready_seq
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        tenant_id:
+          type: string
+        queue:
+          type: string
+        priority:
+          type: integer
+        slot_cost:
+          type: integer
+          minimum: 1
+        payload:
+          $ref: "#/components/schemas/Payload"
+        retry:
+          $ref: "#/components/schemas/RetryPolicy"
+        state:
+          $ref: "#/components/schemas/JobState"
+        attempt_no:
+          type: integer
+          minimum: 0
+        state_version:
+          type: integer
+          format: int64
+          minimum: 1
+        lease_generation:
+          type: integer
+          format: int64
+          minimum: 0
+        available_at:
+          type: string
+          format: date-time
+        ready_seq:
+          type: integer
+          format: int64
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        terminal_at:
+          type: string
+          format: date-time
+        failure:
+          $ref: "#/components/schemas/Failure"
+    SubmitJobRequest:
+      type: object
+      additionalProperties: false
+      required: [job]
+      properties:
+        job:
+          $ref: "#/components/schemas/JobSpec"
+    SubmitJobResponse:
+      type: object
+      additionalProperties: false
+      required: [job, duplicate]
+      properties:
+        job:
+          $ref: "#/components/schemas/Job"
+        duplicate:
+          type: boolean
+    WorkflowNode:
+      type: object
+      additionalProperties: false
+      required: [key, job]
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 128
+        job:
+          $ref: "#/components/schemas/JobSpec"
+    SubmitWorkflowRequest:
+      type: object
+      additionalProperties: false
+      required: [nodes]
+      properties:
+        tenant_id:
+          type: string
+          maxLength: 128
+          default: default
+        nodes:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/WorkflowNode"
+    SubmitWorkflowResponse:
+      type: object
+      additionalProperties: false
+      required: [jobs, duplicate]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        duplicate:
+          type: boolean
+    SubmitDAGResponse:
+      type: object
+      additionalProperties: false
+      required: [dag_id, jobs, duplicate]
+      properties:
+        dag_id:
+          type: string
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        duplicate:
+          type: boolean
+    DeadLetter:
+      type: object
+      additionalProperties: false
+      required: [job_id, failure, created_at]
+      properties:
+        job_id:
+          type: string
+        failure:
+          $ref: "#/components/schemas/Failure"
+        created_at:
+          type: string
+          format: date-time
+        redriven_job_id:
+          type: string
+    DeadLetterListResponse:
+      type: object
+      additionalProperties: false
+      required: [dead_letters]
+      properties:
+        dead_letters:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeadLetter"
+    RedriveDeadLetterResponse:
+      type: object
+      additionalProperties: false
+      required: [job, duplicate]
+      properties:
+        job:
+          $ref: "#/components/schemas/Job"
+        duplicate:
+          type: boolean
+    CronTrigger:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - tenant_id
+        - expression
+        - job
+        - next_fire_at
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        tenant_id:
+          type: string
+        expression:
+          type: string
+        job:
+          $ref: "#/components/schemas/JobSpec"
+        next_fire_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateCronTriggerRequest:
+      type: object
+      additionalProperties: false
+      required: [expression, job]
+      properties:
+        tenant_id:
+          type: string
+          default: default
+        expression:
+          type: string
+        job:
+          $ref: "#/components/schemas/JobSpec"
+    CreateCronTriggerResponse:
+      type: object
+      additionalProperties: false
+      required: [trigger, duplicate]
+      properties:
+        trigger:
+          $ref: "#/components/schemas/CronTrigger"
+        duplicate:
+          type: boolean
+    RegisterWorkerRequest:
+      type: object
+      additionalProperties: false
+      required: [worker_id, slots]
+      properties:
+        worker_id:
+          type: string
+          pattern: "^[A-Za-z0-9_.-]+$"
+          maxLength: 128
+        slots:
+          type: integer
+          minimum: 1
+    RegisterWorkerResponse:
+      type: object
+      additionalProperties: false
+      required: [worker_id, heartbeat_every, lease_ttl, server_time]
+      properties:
+        worker_id:
+          type: string
+        heartbeat_every:
+          type: integer
+          format: int64
+          description: Heartbeat interval in nanoseconds.
+        lease_ttl:
+          type: integer
+          format: int64
+          description: Lease TTL in nanoseconds.
+        server_time:
+          type: string
+          format: date-time
+    AcquireLeasesRequest:
+      type: object
+      additionalProperties: false
+      required: [available_slots, limit]
+      properties:
+        available_slots:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+    LeaseRef:
+      type: object
+      additionalProperties: false
+      required: [job_id, attempt_no, generation, token]
+      properties:
+        job_id:
+          type: string
+        attempt_no:
+          type: integer
+          minimum: 1
+        generation:
+          type: integer
+          format: int64
+          minimum: 1
+        token:
+          type: string
+          minLength: 1
+    Lease:
+      type: object
+      additionalProperties: false
+      required:
+        - job_id
+        - attempt_no
+        - generation
+        - token
+        - worker_id
+        - expires_at
+        - idempotency_key
+        - slot_cost
+        - payload
+      properties:
+        job_id:
+          type: string
+        attempt_no:
+          type: integer
+          minimum: 1
+        generation:
+          type: integer
+          format: int64
+          minimum: 1
+        token:
+          type: string
+        worker_id:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        idempotency_key:
+          type: string
+          description: Stable key for idempotent payload side effects.
+        slot_cost:
+          type: integer
+          minimum: 1
+        payload:
+          $ref: "#/components/schemas/Payload"
+    AcquireLeasesResponse:
+      type: object
+      additionalProperties: false
+      required: [leases]
+      properties:
+        leases:
+          type: array
+          items:
+            $ref: "#/components/schemas/Lease"
+    HeartbeatRequest:
+      type: object
+      additionalProperties: false
+      required: [leases]
+      properties:
+        leases:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/LeaseRef"
+    HeartbeatResult:
+      type: object
+      additionalProperties: false
+      required: [job_id, accepted]
+      properties:
+        job_id:
+          type: string
+        accepted:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+    HeartbeatResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/HeartbeatResult"
+    StartAttemptRequest:
+      $ref: "#/components/schemas/LeaseRef"
+    StartAttemptsRequest:
+      type: object
+      additionalProperties: false
+      required: [leases]
+      properties:
+        leases:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/LeaseRef"
+    StartResult:
+      type: object
+      additionalProperties: false
+      required: [job_id, started]
+      properties:
+        job_id:
+          type: string
+        started:
+          type: boolean
+        error:
+          $ref: "#/components/schemas/Error"
+    StartAttemptsResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/StartResult"
+    CompleteAttemptRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - job_id
+        - attempt_no
+        - generation
+        - token
+        - output_digest
+      properties:
+        job_id:
+          type: string
+        attempt_no:
+          type: integer
+          minimum: 1
+        generation:
+          type: integer
+          format: int64
+          minimum: 1
+        token:
+          type: string
+        worker_id:
+          type: string
+        success:
+          type: boolean
+        retryable:
+          type: boolean
+        output_digest:
+          type: string
+          minLength: 1
+        failure:
+          $ref: "#/components/schemas/Failure"
+    CompleteAttemptsRequest:
+      type: object
+      additionalProperties: false
+      required: [completions]
+      properties:
+        completions:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/CompleteAttemptRequest"
+    CompletionResult:
+      type: object
+      additionalProperties: false
+      required: [job_id]
+      properties:
+        job_id:
+          type: string
+        receipt:
+          $ref: "#/components/schemas/CompletionReceipt"
+        error:
+          $ref: "#/components/schemas/Error"
+    CompleteAttemptsResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompletionResult"
+    CompletionReceipt:
+      type: object
+      additionalProperties: false
+      required: [job_id, state, state_version, committed_at, duplicate]
+      properties:
+        job_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        state_version:
+          type: integer
+          format: int64
+        committed_at:
+          type: string
+          format: date-time
+        duplicate:
+          type: boolean
+    JobEvent:
+      type: object
+      additionalProperties: false
+      required: [sequence, type, state, state_version, occurred_at, actor, payload]
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        type:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        state_version:
+          type: integer
+          format: int64
+          minimum: 1
+        occurred_at:
+          type: string
+          format: date-time
+        actor:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+    JobHistoryPage:
+      type: object
+      additionalProperties: false
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobEvent"
+        next_before_seq:
+          type: integer
+          format: int64
+          minimum: 1
+    CancelJobRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+    ForceJobRequest:
+      type: object
+      additionalProperties: false
+      required: [action, reason]
+      properties:
+        action:
+          type: string
+          enum: [release, fail, dead_letter]
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+    ActionReceipt:
+      type: object
+      additionalProperties: false
+      required:
+        - job_id
+        - action
+        - state
+        - state_version
+        - actor
+        - committed_at
+        - duplicate
+      properties:
+        job_id:
+          type: string
+        action:
+          type: string
+        state:
+          $ref: "#/components/schemas/JobState"
+        state_version:
+          type: integer
+          format: int64
+        actor:
+          type: string
+        committed_at:
+          type: string
+          format: date-time
+        duplicate:
+          type: boolean
+    QueueDepth:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - queue
+        - pending
+        - scheduled
+        - running
+        - retrying
+        - active
+        - max_depth
+        - active_slots
+        - max_slots
+        - oldest_ready_age_ms
+      properties:
+        tenant_id:
+          type: string
+        queue:
+          type: string
+        pending:
+          type: integer
+          format: int64
+          minimum: 0
+        scheduled:
+          type: integer
+          format: int64
+          minimum: 0
+        running:
+          type: integer
+          format: int64
+          minimum: 0
+        retrying:
+          type: integer
+          format: int64
+          minimum: 0
+        active:
+          type: integer
+          format: int64
+          minimum: 0
+        max_depth:
+          type: integer
+          format: int64
+          minimum: 0
+        active_slots:
+          type: integer
+          format: int64
+          minimum: 0
+        max_slots:
+          type: integer
+          format: int64
+          minimum: 0
+        oldest_ready_age_ms:
+          type: integer
+          format: int64
+          minimum: 0
+    QueueDepthResponse:
+      type: object
+      additionalProperties: false
+      required: [queues]
+      properties:
+        queues:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueueDepth"
+    WorkerStatus:
+      type: string
+      enum: [healthy, stale, offline]
+    WorkerHealth:
+      type: object
+      additionalProperties: false
+      required:
+        - worker_id
+        - status
+        - capacity_slots
+        - active_slots
+        - active_leases
+        - last_heartbeat_at
+        - heartbeat_age_ms
+        - oldest_lease_age_ms
+      properties:
+        worker_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/WorkerStatus"
+        capacity_slots:
+          type: integer
+          minimum: 0
+        active_slots:
+          type: integer
+          minimum: 0
+        active_leases:
+          type: integer
+          minimum: 0
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        heartbeat_age_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        oldest_lease_age_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        oldest_lease_expiry:
+          type: string
+          format: date-time
+    WorkerHealthResponse:
+      type: object
+      additionalProperties: false
+      required: [workers]
+      properties:
+        workers:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkerHealth"
+    DAGEdge:
+      type: object
+      additionalProperties: false
+      required: [from_job_id, to_job_id]
+      properties:
+        from_job_id:
+          type: string
+        to_job_id:
+          type: string
+    DAGDetail:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, jobs, edges, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        tenant_id:
+          type: string
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/DAGEdge"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - request_too_large
+            - idempotency_conflict
+            - queue_full
+            - cycle_detected
+            - stale_lease
+            - terminal_job
+            - dead_letter_redriven
+            - state_conflict
+            - not_found
+            - method_not_allowed
+            - request_timeout
+            - request_canceled
+            - internal_error
+            - shutting_down
+            - not_ready
+            - triggers_disabled
+            - not_supported
+            - worker_conflict
+        message:
+          type: string
+        retry_after_seconds:
+          type: integer
+          minimum: 1

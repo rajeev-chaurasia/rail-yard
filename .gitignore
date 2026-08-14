@@ -1,0 +1,20 @@
+# Go
+/bin/
+/coverage/
+*.test
+*.out
+
+# Local runtime data
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Generated qualification runs are copied selectively.
+/results/_work/
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

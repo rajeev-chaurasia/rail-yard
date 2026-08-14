@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{.CSRFToken}}">
+  <meta name="ops-base-path" content="{{.BasePath}}">
+  <meta name="poll-interval-ms" content="{{.PollIntervalMS}}">
+  <title>Rail Yard Operations</title>
+  <link rel="stylesheet" href="{{.BasePath}}assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to dashboard</a>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">Rail Yard</p>
+      <h1>Operations dashboard</h1>
+    </div>
+    <div class="operator">
+      <div>
+        <label for="actor">Operator identity</label>
+        <input id="actor" name="actor" type="text" maxlength="128" autocomplete="username"
+               placeholder="name or on-call ID" required>
+      </div>
+      <div>
+        <label for="reason">Change reason</label>
+        <input id="reason" name="reason" type="text" maxlength="1024"
+               placeholder="required for cancel and force">
+      </div>
+      <div>
+        <label for="force-action">Force action</label>
+        <select id="force-action" name="force-action">
+          <option value="release">Release lease</option>
+          <option value="fail">Mark failed</option>
+          <option value="dead_letter">Send to DLQ</option>
+        </select>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="status-bar" aria-label="Dashboard status">
+      <p id="connection-status" role="status" aria-live="polite">Loading current state</p>
+      <p id="last-updated">Not updated yet</p>
+      <button id="refresh" class="secondary" type="button">Refresh now</button>
+    </section>
+
+    <section aria-labelledby="summary-heading">
+      <h2 id="summary-heading">Current state</h2>
+      <div class="stat-grid">
+        <article class="stat-card">
+          <h3>Queue depth</h3>
+          <p id="queue-total" class="stat-value">0</p>
+        </article>
+        <article class="stat-card">
+          <h3>Running jobs</h3>
+          <p id="running-total" class="stat-value">0</p>
+        </article>
+        <article class="stat-card">
+          <h3>Failed jobs</h3>
+          <p id="failed-total" class="stat-value">0</p>
+        </article>
+        <article class="stat-card">
+          <h3>Healthy workers</h3>
+          <p id="worker-total" class="stat-value">0 / 0</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="queues-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Scheduler</p>
+          <h2 id="queues-heading">Aggregate queue depth</h2>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Job counts grouped by tenant, queue, and state</caption>
+          <thead>
+            <tr><th scope="col">Tenant</th><th scope="col">Queue</th><th scope="col">State</th><th scope="col">Depth</th></tr>
+          </thead>
+          <tbody id="queue-body"></tbody>
+        </table>
+      </div>
+      <p id="queue-empty" class="empty" hidden>No queued work.</p>
+    </section>
+
+    <div class="split">
+      <section class="panel" aria-labelledby="running-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Active</p>
+            <h2 id="running-heading">Running jobs</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>Running jobs and operator controls</caption>
+            <thead>
+              <tr><th scope="col">Job</th><th scope="col">Queue</th><th scope="col">Attempt</th><th scope="col">Updated</th><th scope="col">Actions</th></tr>
+            </thead>
+            <tbody id="running-body"></tbody>
+          </table>
+        </div>
+        <p id="running-empty" class="empty" hidden>No running jobs.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="failed-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Attention</p>
+            <h2 id="failed-heading">Failed jobs</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>Failed jobs and operator controls</caption>
+            <thead>
+              <tr><th scope="col">Job</th><th scope="col">Failure</th><th scope="col">Updated</th><th scope="col">Actions</th></tr>
+            </thead>
+            <tbody id="failed-body"></tbody>
+          </table>
+        </div>
+        <p id="failed-empty" class="empty" hidden>No failed jobs.</p>
+      </section>
+    </div>
+
+    <section class="panel" aria-labelledby="workers-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Capacity</p>
+          <h2 id="workers-heading">Worker health and leases</h2>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Worker health, capacity, heartbeat, and lease age</caption>
+          <thead>
+            <tr><th scope="col">Worker</th><th scope="col">Health</th><th scope="col">Slots</th><th scope="col">Leases</th><th scope="col">Last heartbeat</th><th scope="col">Oldest lease</th><th scope="col">Nearest expiry</th></tr>
+          </thead>
+          <tbody id="worker-body"></tbody>
+        </table>
+      </div>
+      <p id="worker-empty" class="empty" hidden>No workers registered.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="dlq-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Recovery</p>
+          <h2 id="dlq-heading">Dead-letter queue</h2>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Dead-lettered jobs with bounded failure context and redrive controls</caption>
+          <thead>
+            <tr><th scope="col">Job</th><th scope="col">Failure class</th><th scope="col">Message</th><th scope="col">Created</th><th scope="col">Redrive</th></tr>
+          </thead>
+          <tbody id="dlq-body"></tbody>
+        </table>
+      </div>
+      <p id="dlq-empty" class="empty" hidden>No dead letters.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="dag-heading">
+      <div class="panel-heading dag-heading">
+        <div>
+          <p class="eyebrow">Workflow</p>
+          <h2 id="dag-heading">One-run DAG</h2>
+        </div>
+        <form id="run-form" class="run-search">
+          <label for="run-id">Run ID</label>
+          <div>
+            <input id="run-id" name="run-id" type="text" maxlength="128" required>
+            <button type="submit">Load run</button>
+          </div>
+        </form>
+      </div>
+      <p id="run-status" role="status" aria-live="polite">Enter a run ID to inspect its graph.</p>
+      <ol id="dag" class="dag" aria-label="Run dependency graph"></ol>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="{{.BasePath}}assets/app.js" defer></script>
+</body>
+</html>

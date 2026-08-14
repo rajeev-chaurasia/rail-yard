@@ -1,0 +1,58 @@
+groups:
+  - name: railyard-slos
+    rules:
+      - record: railyard:slo:ready_start:good_jobs30m
+        expr: |
+          sum(
+            increase(
+              railyard_job_latency_seconds_bucket{
+                stage="ready_to_lease",
+                le="5"
+              }[30m]
+            )
+          )
+
+      - record: railyard:slo:ready_start:observations30m
+        expr: |
+          sum(
+            increase(
+              railyard_job_latency_seconds_count{
+                stage="ready_to_lease"
+              }[30m]
+            )
+          )
+
+      - record: railyard:slo:ready_start:ratio30m
+        expr: |
+          railyard:slo:ready_start:good_jobs30m
+          /
+          railyard:slo:ready_start:observations30m
+
+      - alert: RailYardReadyStartSLOBreach
+        expr: |
+          railyard:slo:ready_start:ratio30m < 0.99
+          and
+          railyard:slo:ready_start:observations30m >= 20
+        for: 5m
+        labels:
+          service: railyard
+          severity: critical
+          slo: ready-job-start-latency
+          team: sre
+        annotations:
+          summary: Ready-job start success is below 99 percent
+          description: The 30-minute ready-to-lease ratio has remained below 99 percent for five minutes.
+          runbook_url: https://github.com/rajeev-chaurasia/rail-yard/blob/main/docs/ALERTS.md#slo-1-ready-job-start-latency
+
+      - alert: RailYardDLQDepthHigh
+        expr: railyard_dlq_depth >= 10
+        for: 10m
+        labels:
+          service: railyard
+          severity: warning
+          slo: dlq-depth
+          team: sre
+        annotations:
+          summary: Dead-letter depth reached 10 entries
+          description: At least 10 jobs have remained in the dead-letter queue for ten minutes.
+          runbook_url: https://github.com/rajeev-chaurasia/rail-yard/blob/main/docs/ALERTS.md#slo-2-dead-letter-queue-depth

@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.6"
+  GO_IMAGE: golang:1.26.6-alpine
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  quality:
+    name: Format, vet, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        run: go run ./hack/ci format
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Run vet
+        run: go run ./hack/ci vet
+
+      - name: Run tests
+        run: go run ./hack/ci test
+
+      - name: Validate SLO rules and dashboard
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/prometheus:/rules:ro" \
+            prom/prometheus:v3.5.0 check rules /rules/alerts.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/prometheus:/rules:ro" \
+            prom/prometheus:v3.5.0 test rules /rules/slo-tests.yml
+          jq empty deploy/grafana/dashboards/railyard-overview.json
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run race suite
+        run: go run ./hack/ci race
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run golangci-lint
+        run: go run ./hack/ci lint
+
+  replay:
+    name: Replay smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run replay smoke test
+        run: go run ./hack/ci replay-smoke
+
+  integration:
+    name: Docker Compose integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run integration harness
+        run: >-
+          go run ./hack/ci compose-integration
+          --project=rail-yard-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          --output=artifacts/integration
+
+      - name: Upload integration artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/integration/
+          if-no-files-found: warn
+          retention-days: 7
+
+  bounded-chaos:
+    name: Seeded bounded chaos
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run bounded chaos harness
+        run: >-
+          go run ./hack/ci compose-chaos
+          --project-prefix=rail-yard-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          --runs=1
+          --jobs=1000
+          --seed=26081401
+          --output=artifacts/chaos
+
+      - name: Upload chaos artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/chaos/
+          if-no-files-found: warn
+          retention-days: 7

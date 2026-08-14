@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-14T10:28:00Z",
+  "go_version": "go1.26.6",
+  "os": "windows",
+  "architecture": "amd64",
+  "decisions": 50000,
+  "clean_process_replays": 3,
+  "byte_match_percent": 100,
+  "sha256": "06ea0a236743ed4a9782879f9fff78242fd6e29da24ed78cc9c90e46a6376bdf",
+  "command": "RAILYARD_FULL_REPLAY=1 go test -run ^TestFullReplayQualification$ -count=1 -v ./internal/replay",
+  "passed": true
+}

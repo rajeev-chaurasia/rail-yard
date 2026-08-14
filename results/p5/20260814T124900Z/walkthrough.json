@@ -1,0 +1,19 @@
+{
+  "run_id": "20260814T124900Z",
+  "actor": "p5-walkthrough",
+  "started_at": "2026-08-14T12:45:53.0072488Z",
+  "completed_at": "2026-08-14T12:46:44.9566894Z",
+  "workflow_job_ids": [
+    "e1b5174a956dc770bde8b8fb18245a15",
+    "110add676db9d89787fcda1a29963f4c",
+    "bcdcd14668c7764068aaf2a18ed8a0b2"
+  ],
+  "reassigned_job_id": "8bbb90c8f457aaba5ddd29acf6c60765",
+  "reassignment_observed_ns": 11627543700,
+  "dead_letter_job_id": "5a6fd7f9979f9b74d602e71e1b1fb963",
+  "redriven_job_id": "e3baf15667136cce83ae8e8ed9163fdf",
+  "audit_event_count": 6,
+  "live_alert_waits_skipped": true,
+  "slo_rule_evidence": "results/slo/20260814T104500Z/summary.json",
+  "passed": true
+}
