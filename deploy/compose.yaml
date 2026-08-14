@@ -87,6 +87,7 @@ services:
       - --db-path=${RAILYARD_DB_PATH:-/var/lib/railyard/railyard.db}
       - --redis-url=${RAILYARD_REDIS_URL:-redis://redis:6379/0}
       - --allow-shell=${RAILYARD_ALLOW_SHELL:-false}
+      - --lease-ttl=${RAILYARD_LEASE_TTL:-2.5s}
     environment:
       RAILYARD_DB_PATH: ${RAILYARD_DB_PATH:-/var/lib/railyard/railyard.db}
       RAILYARD_REDIS_URL: ${RAILYARD_REDIS_URL:-redis://redis:6379/0}

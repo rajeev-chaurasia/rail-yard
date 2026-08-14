@@ -24,7 +24,9 @@ stored in a synchronized directory, but the live WAL database may not.
 The workload contains 50,000 independent no-op jobs with fixed serialized
 payload size, one tenant, one queue, and slot cost one. Eight workers use the
 same frozen capacity of 256 slots each for all throughput runs. Chaos runs use
-the reference 16-slot worker configuration.
+the reference 16-slot worker configuration. Throughput runs use a 10-second
+lease to absorb high-concurrency heartbeat latency; recovery qualification uses
+the default 2.5-second lease.
 
 Report these rates separately:
 

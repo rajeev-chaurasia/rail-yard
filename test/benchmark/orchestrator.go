@@ -317,6 +317,7 @@ func runComposeBenchmark(
 		environment: []string{
 			"RAILYARD_HTTP_PORT=" + strconv.Itoa(port),
 			"RAILYARD_WORKER_SLOTS=" + strconv.Itoa(options.workerSlots),
+			"RAILYARD_LEASE_TTL=10s",
 		},
 	}
 	captureDirectory := filepath.Join(options.output, "captures", name)
