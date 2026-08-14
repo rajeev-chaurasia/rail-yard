@@ -243,6 +243,7 @@ func verifyCronTrigger(
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "integration-cron")
+	request.Header.Set("X-Rail-Yard-Actor", "integration")
 	response, err := client.Do(request)
 	if err != nil {
 		return "", err
@@ -337,6 +338,7 @@ func submitJob(
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Idempotency-Key", key)
+	httpRequest.Header.Set("X-Rail-Yard-Actor", "integration")
 	response, err := client.Do(httpRequest)
 	if err != nil {
 		return domain.Job{}, err

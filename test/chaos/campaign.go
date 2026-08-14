@@ -466,6 +466,7 @@ func (c submissionClient) submit(
 		request.Header.Set("Accept", "application/json")
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", key)
+		request.Header.Set("X-Rail-Yard-Actor", "chaos-controller")
 		hostBefore := time.Now().UTC()
 		response, err := c.client.Do(request)
 		hostAfter := time.Now().UTC()

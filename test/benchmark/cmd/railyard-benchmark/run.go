@@ -456,6 +456,7 @@ func (c *benchmarkClient) submitJob(
 		if err == nil {
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Idempotency-Key", record.IdempotencyKey)
+			request.Header.Set("X-Rail-Yard-Actor", "benchmark")
 			var response *http.Response
 			response, err = c.client.Do(request)
 			if err == nil {
