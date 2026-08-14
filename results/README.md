@@ -66,7 +66,7 @@ go run ./test/chaos \
   --runs 1 \
   --jobs 5000 \
   --worker-kills 20 \
-  --job-duration 250ms \
+  --job-duration 10s \
   --action-min 100ms \
   --action-max 500ms \
   --seed <recorded-base-seed> \
