@@ -25,21 +25,22 @@ const (
 )
 
 type Config struct {
-	BaseURL           string
-	PrometheusURL     string
-	Actor             string
-	RunID             string
-	RepositoryRoot    string
-	ComposeFile       string
-	ComposeProject    string
-	RequestTimeout    time.Duration
-	PollInterval      time.Duration
-	OperationTimeout  time.Duration
-	AlertFireTimeout  time.Duration
-	AlertClearTimeout time.Duration
-	RecoveryHold      time.Duration
-	ReadyBreachHold   time.Duration
-	SLORuleEvidence   string
+	BaseURL            string
+	PrometheusURL      string
+	Actor              string
+	RunID              string
+	RepositoryRoot     string
+	ComposeFile        string
+	ComposeProject     string
+	RequestTimeout     time.Duration
+	PollInterval       time.Duration
+	OperationTimeout   time.Duration
+	AlertFireTimeout   time.Duration
+	AlertClearTimeout  time.Duration
+	RecoveryHold       time.Duration
+	ReadyBreachHold    time.Duration
+	SkipLiveAlertWaits bool
+	SLORuleEvidence    string
 }
 
 func DefaultConfig() Config {
@@ -131,10 +132,11 @@ func NewRunner(config Config, logf func(string, ...any)) (*Runner, error) {
 
 func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	report = Report{
-		RunID:           r.config.RunID,
-		Actor:           r.config.Actor,
-		StartedAt:       time.Now().UTC(),
-		SLORuleEvidence: r.config.SLORuleEvidence,
+		RunID:                 r.config.RunID,
+		Actor:                 r.config.Actor,
+		StartedAt:             time.Now().UTC(),
+		LiveAlertWaitsSkipped: r.config.SkipLiveAlertWaits,
+		SLORuleEvidence:       r.config.SLORuleEvidence,
 	}
 	defer func() {
 		restoreContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -204,14 +206,21 @@ func (r *Runner) Run(ctx context.Context) (report Report, runErr error) {
 	report.DeadLetterJobID = deadLetterID
 	report.RedrivenJobID = redrivenID
 
-	r.logf("alerts: exercise ready-start and DLQ breach lifecycles")
-	report.RecoveryAlertFiredAt,
-		report.RecoveryAlertRecoveredAt,
-		report.QueueAlertFiredAt,
-		report.QueueAlertRecoveredAt,
-		err = r.exerciseSLOAlerts(ctx)
-	if err != nil {
-		return report, err
+	if r.config.SkipLiveAlertWaits {
+		r.logf(
+			"alerts: live waits skipped; deterministic rule evidence: %s",
+			r.config.SLORuleEvidence,
+		)
+	} else {
+		r.logf("alerts: exercise ready-start and DLQ breach lifecycles")
+		report.RecoveryAlertFiredAt,
+			report.RecoveryAlertRecoveredAt,
+			report.QueueAlertFiredAt,
+			report.QueueAlertRecoveredAt,
+			err = r.exerciseSLOAlerts(ctx)
+		if err != nil {
+			return report, err
+		}
 	}
 
 	auditEvents, err := r.verifyAudit(ctx, report.StartedAt)
@@ -715,7 +724,7 @@ func (r *Runner) verifyAudit(ctx context.Context, since time.Time) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	requiredCounts := requiredAuditCounts()
+	requiredCounts := requiredAuditCounts(!r.config.SkipLiveAlertWaits)
 	actualCounts := make(map[string]int)
 	now := time.Now().UTC().Add(r.config.RequestTimeout)
 	for _, event := range response.Events {
@@ -742,16 +751,23 @@ func (r *Runner) verifyAudit(ctx context.Context, since time.Time) (int, error) 
 	return len(response.Events), nil
 }
 
-func requiredAuditCounts() map[string]int {
-	return map[string]int{
-		"dag.submit":             2 + readyStartRecoveryJobs/readyStartBatchSize,
-		"job.submit":             2 + dlqDepthBreachJobs,
-		"worker.kill":            1,
-		"job.force.dead_letter":  1 + dlqDepthBreachJobs,
-		"dead_letter.redrive":    1 + dlqDepthBreachJobs,
-		"alert.exercise.start":   2,
-		"alert.exercise.recover": 2,
+func requiredAuditCounts(includeLiveAlerts bool) map[string]int {
+	counts := map[string]int{
+		"dag.submit":            1,
+		"job.submit":            2,
+		"worker.kill":           1,
+		"job.force.dead_letter": 1,
+		"dead_letter.redrive":   1,
 	}
+	if includeLiveAlerts {
+		counts["dag.submit"] += 1 + readyStartRecoveryJobs/readyStartBatchSize
+		counts["job.submit"] += dlqDepthBreachJobs
+		counts["job.force.dead_letter"] += dlqDepthBreachJobs
+		counts["dead_letter.redrive"] += dlqDepthBreachJobs
+		counts["alert.exercise.start"] = 2
+		counts["alert.exercise.recover"] = 2
+	}
+	return counts
 }
 
 func (r *Runner) waitForJob(

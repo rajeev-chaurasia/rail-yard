@@ -60,6 +60,12 @@ func run() error {
 		config.ReadyBreachHold,
 		"worker pause used to breach ready-start latency",
 	)
+	flag.BoolVar(
+		&config.SkipLiveAlertWaits,
+		"skip-live-alert-waits",
+		config.SkipLiveAlertWaits,
+		"skip the supplemental live Prometheus alert exercise",
+	)
 	flag.StringVar(
 		&config.SLORuleEvidence,
 		"slo-rule-evidence",

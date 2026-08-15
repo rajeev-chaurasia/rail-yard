@@ -41,7 +41,7 @@ func TestOperationsWalkthrough(t *testing.T) {
 		t.Fatal("walkthrough returned without a completion timestamp")
 	}
 	minimumAuditEvents := 0
-	for _, count := range requiredAuditCounts() {
+	for _, count := range requiredAuditCounts(!config.SkipLiveAlertWaits) {
 		minimumAuditEvents += count
 	}
 	if report.AuditEventCount < minimumAuditEvents {

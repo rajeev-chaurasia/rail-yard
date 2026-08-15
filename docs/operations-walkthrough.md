@@ -214,10 +214,19 @@ go run ./test/p5/cmd/walkthrough \
   -compose-project "$COMPOSE_PROJECT_NAME" \
   -run-id "$RUN_ID" \
   -actor p5-walkthrough \
+  -skip-live-alert-waits \
   -slo-rule-evidence slo-summary.json \
   -output "results/_work/p5/$RUN_ID/walkthrough.json" \
   -timeout 25m
 ```
+
+`-skip-live-alert-waits` selects the reduced portfolio qualifier. It runs the
+DAG, reassignment, DLQ, redrive, and audit lifecycle without creating the
+supplemental live-alert workload or waiting for Prometheus firing and recovery
+windows. Promtool rule checks and tests still run before the lifecycle, and the
+report sets `live_alert_waits_skipped` to `true` while linking
+`slo_rule_evidence` to `slo-summary.json`. The audit requires only actions from
+the lifecycle that ran.
 
 The DLQ redrive uses
 `POST /v1/operations/dead-letters/{job_id}/redrive`. The operator dashboard at

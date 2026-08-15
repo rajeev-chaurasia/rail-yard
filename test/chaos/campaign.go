@@ -1583,10 +1583,20 @@ func selectKilledLeases(
 			affected = append(affected, lease)
 			continue
 		}
+		if state.State != "SUCCEEDED" && state.State != "FAILED" && state.State != "EXPIRED" {
+			return nil, fmt.Errorf(
+				"snapshot lease %s has completion timestamp in state %s",
+				key,
+				state.State,
+			)
+		}
 		if state.CompletedAt.Before(lowerBound) {
 			continue
 		}
 		if state.CompletedAt.After(upperBound) {
+			if state.State == "SUCCEEDED" {
+				continue
+			}
 			affected = append(affected, lease)
 			continue
 		}

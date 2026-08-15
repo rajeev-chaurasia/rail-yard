@@ -204,6 +204,8 @@ func TestKilledLeaseSelectionSurvivesReaperAndCompletionRace(t *testing.T) {
 		{JobID: "reaped", AttemptNo: 1, Generation: 11},
 		{JobID: "finished", AttemptNo: 1, Generation: 12},
 		{JobID: "active", AttemptNo: 2, Generation: 13},
+		{JobID: "late-success", AttemptNo: 1, Generation: 14},
+		{JobID: "late-failure", AttemptNo: 1, Generation: 15},
 	}
 	states := []leaseBoundaryState{
 		{
@@ -226,12 +228,26 @@ func TestKilledLeaseSelectionSurvivesReaperAndCompletionRace(t *testing.T) {
 			Generation: 13,
 			State:      "RUNNING",
 		},
+		{
+			JobID:       "late-success",
+			AttemptNo:   1,
+			Generation:  14,
+			State:       "SUCCEEDED",
+			CompletedAt: killTime.Add(6 * time.Millisecond),
+		},
+		{
+			JobID:       "late-failure",
+			AttemptNo:   1,
+			Generation:  15,
+			State:       "FAILED",
+			CompletedAt: killTime.Add(6 * time.Millisecond),
+		},
 	}
 	affected, err := selectKilledLeases(snapshot, states, killTime, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("select killed leases: %v", err)
 	}
-	want := []activeLease{snapshot[0], snapshot[2]}
+	want := []activeLease{snapshot[0], snapshot[2], snapshot[4]}
 	if !reflect.DeepEqual(affected, want) {
 		t.Fatalf("affected leases=%#v want=%#v", affected, want)
 	}
@@ -239,16 +255,32 @@ func TestKilledLeaseSelectionSurvivesReaperAndCompletionRace(t *testing.T) {
 
 func TestKilledLeaseSelectionFailsOnBoundaryUncertainty(t *testing.T) {
 	killTime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
-	snapshot := []activeLease{{JobID: "ambiguous", AttemptNo: 1, Generation: 1}}
-	states := []leaseBoundaryState{{
-		JobID:       "ambiguous",
-		AttemptNo:   1,
-		Generation:  1,
-		State:       "SUCCEEDED",
-		CompletedAt: killTime.Add(2 * time.Millisecond),
-	}}
-	if _, err := selectKilledLeases(snapshot, states, killTime, 5*time.Millisecond); err == nil {
-		t.Fatal("completion inside the uncertain kill boundary was scored")
+	for _, state := range []string{"SUCCEEDED", "EXPIRED", "FAILED"} {
+		for _, offset := range []time.Duration{
+			-5 * time.Millisecond,
+			0,
+			5 * time.Millisecond,
+		} {
+			name := fmt.Sprintf("%s/%s", state, offset)
+			t.Run(name, func(t *testing.T) {
+				snapshot := []activeLease{{JobID: "ambiguous", AttemptNo: 1, Generation: 1}}
+				states := []leaseBoundaryState{{
+					JobID:       "ambiguous",
+					AttemptNo:   1,
+					Generation:  1,
+					State:       state,
+					CompletedAt: killTime.Add(offset),
+				}}
+				if _, err := selectKilledLeases(
+					snapshot,
+					states,
+					killTime,
+					5*time.Millisecond,
+				); err == nil {
+					t.Fatal("completion inside the uncertain kill boundary was scored")
+				}
+			})
+		}
 	}
 }
 

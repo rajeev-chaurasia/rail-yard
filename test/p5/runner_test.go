@@ -33,7 +33,7 @@ func TestReadyStartRecoveryPopulationClearsBreachRatio(t *testing.T) {
 
 func TestRequiredAuditCountsCoverAlertOperations(t *testing.T) {
 	t.Parallel()
-	counts := requiredAuditCounts()
+	counts := requiredAuditCounts(true)
 	want := map[string]int{
 		"dag.submit":             26,
 		"job.submit":             12,
@@ -42,6 +42,26 @@ func TestRequiredAuditCountsCoverAlertOperations(t *testing.T) {
 		"dead_letter.redrive":    11,
 		"alert.exercise.start":   2,
 		"alert.exercise.recover": 2,
+	}
+	for action, count := range want {
+		if counts[action] != count {
+			t.Errorf("audit count for %q = %d, want %d", action, counts[action], count)
+		}
+	}
+}
+
+func TestRequiredAuditCountsOmitSkippedAlertOperations(t *testing.T) {
+	t.Parallel()
+	counts := requiredAuditCounts(false)
+	want := map[string]int{
+		"dag.submit":            1,
+		"job.submit":            2,
+		"worker.kill":           1,
+		"job.force.dead_letter": 1,
+		"dead_letter.redrive":   1,
+	}
+	if len(counts) != len(want) {
+		t.Fatalf("reduced audit action count = %d, want %d: %#v", len(counts), len(want), counts)
 	}
 	for action, count := range want {
 		if counts[action] != count {
