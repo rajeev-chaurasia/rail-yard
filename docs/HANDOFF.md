@@ -4,7 +4,11 @@
 
 Branch: `main`
 
-Current source commit before this handoff: `347853c`
+Resolve the current source commit with:
+
+```text
+git rev-parse HEAD
+```
 
 Remote:
 
@@ -358,14 +362,14 @@ SHA-256 06ea0a236743ed4a9782879f9fff78242fd6e29da24ed78cc9c90e46a6376bdf
 Raw local evidence:
 
 ```text
-%TEMP%\railyard-replay-final-9d66718
+%TEMP%\railyard-replay-final
 ```
 
 Replay must be regenerated after any scheduler or decision-log change.
 
 ### Benchmark
 
-A valid reduced-scope benchmark suite completed on commit `347853c`.
+A valid reduced-scope benchmark suite completed on the published evidence set.
 
 Measured medians:
 
@@ -381,7 +385,7 @@ into compliance.
 Local evidence:
 
 ```text
-results/_work/benchmark-347853c
+results/_work/benchmark-<short commit>
 ```
 
 ### Final chaos evidence
@@ -437,19 +441,10 @@ valid. A target miss remains a measured miss.
 
 ## Git and release notes
 
-Recent implementation commits:
+Inspect the implementation history with:
 
 ```text
-347853c Align benchmark evidence with reduced scope
-adedd84 Attribute internal harness mutations
-7506618 Align reduced qualification and actor contracts
-f81c8e6 Handle empty SLO histogram buckets
-9d66718 Fix restart and evidence correctness gaps
-ad4cfcf Add resumable qualification checkpoints
-fb59b73 Stabilize high-concurrency benchmark leases
-b861df3 Allow qualification on recorded Docker hosts
-14f4f71 Build durable orchestration and operations platform
-23102d9 Document Rail Yard architecture and qualification targets
+git log --oneline --decorate
 ```
 
 Do not publish target numbers as measured results.
