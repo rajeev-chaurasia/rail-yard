@@ -193,7 +193,6 @@ func SQLiteSnapshotDigests(path string) (map[string]string, error) {
 	}{
 		{name: "database", path: path},
 		{name: "wal", path: path + "-wal"},
-		{name: "shm", path: path + "-shm"},
 	}
 	digests := make(map[string]string)
 	for index, component := range components {
@@ -237,7 +236,7 @@ func regularArtifacts(root string) ([]string, error) {
 			return err
 		}
 		relative = filepath.ToSlash(relative)
-		if relative == ChecksumsFile {
+		if relative == ChecksumsFile || strings.HasSuffix(relative, "-shm") {
 			return nil
 		}
 		if err := validateRelativeArtifact(relative); err != nil {

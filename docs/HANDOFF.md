@@ -12,30 +12,22 @@ Remote:
 https://github.com/rajeev-chaurasia/rail-yard.git
 ```
 
-The implementation is complete for P1 through P5. Reduced portfolio
-qualification is the only unfinished work.
+The implementation and reduced portfolio qualification are complete.
 
-At handoff time, a reduced chaos run is active locally:
+Final evidence status:
 
 ```text
-Compose project: railyard-reduced-chaos-r01-s18df879
-Output: results/_work/chaos-347853c-long
-Scope: 5,000 jobs, 20 worker SIGKILLs, one server SIGKILL
-Payload duration: 10s
-Latest observed progress: 5,000 accepted, 1,182 succeeded, 3,818 active
+Evidence validity: valid
+Combined qualification: measured miss
+Benchmark median: 9,807.35 durable lease grants/min
+Chaos correctness: zero lost, zero duplicate canonical outcomes
+Recovery: 16.084s p99 across 282 samples
+Replay: 50,000 decisions, 3 processes, 100% byte match
+P5 lifecycle: passed
+SLO rule tests: passed
 ```
 
-Check it with:
-
-```powershell
-docker compose -f deploy/compose.yaml `
-  -p railyard-reduced-chaos-r01-s18df879 `
-  exec -T server sqlite3 /var/lib/railyard/railyard.db `
-  "SELECT COUNT(*), SUM(state='SUCCEEDED'), SUM(state NOT IN ('SUCCEEDED','FAILED','DEAD_LETTER')) FROM jobs;"
-```
-
-The chaos controller is resumable. Do not delete its output directory while
-the run is active.
+No qualification stack should remain active after handoff.
 
 ## Implemented system
 
@@ -392,21 +384,20 @@ Local evidence:
 results/_work/benchmark-347853c
 ```
 
-### Earlier chaos evidence
-
-One earlier 50,000-job diagnostic run passed:
+### Final chaos evidence
 
 ```text
-50,000 accepted
-50,000 succeeded
+5,000 accepted
+5,000 canonical terminal outcomes
 20 worker kills
 1 server kill
-0 reconciliation violations
-4.381s recovery p99
-70 recovery samples
+0 lost
+0 duplicate canonical outcomes
+16.084s recovery p99
+282 recovery samples
 ```
 
-It predates the final release-audit fixes and is diagnostic only.
+Correctness passed. The five-second recovery target was missed.
 
 ## Known local port conflicts
 
@@ -422,16 +413,12 @@ Grafana: 13000
 
 The benchmark orchestrator can choose a free API port with `--host-port=0`.
 
-## Exact remaining work
+## Optional follow-up work
 
-1. Let the active 5,000-job chaos run finish.
-2. Reconcile its summary and recovery evidence.
-3. Run the reduced P5 lifecycle on the final clean commit.
-4. Run three-process replay on the final clean commit.
-5. Run `hack/results` with final benchmark, chaos, replay, SLO, and P5 paths.
-6. Commit selected raw evidence and the qualification summary.
-7. Update README status and measured values.
-8. Push the final evidence commit.
+1. Raise benchmark median above 10,000 durable lease grants/min.
+2. Reduce recovery p99 below five seconds under the same chaos scope.
+3. Rerun qualification with identical flags after performance changes.
+4. Replace the measured-miss evidence only after the new set validates.
 
 ## Final evidence command
 

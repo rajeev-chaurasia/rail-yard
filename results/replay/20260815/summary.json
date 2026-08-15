@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "evidence_valid": true,
+  "decisions": 50000,
+  "clean_process_replays": 3,
+  "process_ids": [
+    31664,
+    58988,
+    47040
+  ],
+  "byte_match_percent": 100,
+  "sha256": "06ea0a236743ed4a9782879f9fff78242fd6e29da24ed78cc9c90e46a6376bdf",
+  "checksum_entries_verified": 7,
+  "passed": true
+}

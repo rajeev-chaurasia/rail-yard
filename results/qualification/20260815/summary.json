@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "status": "miss",
+  "evidence_valid": true,
+  "qualified": false,
+  "throughput": {
+    "evidence_valid": true,
+    "qualified": false,
+    "measured_runs": 3,
+    "durable_lease_grants_per_minute": 9807.349592105187,
+    "target_per_minute": 10000
+  },
+  "chaos": {
+    "evidence_valid": true,
+    "correctness_qualified": true,
+    "recovery_qualified": false,
+    "runs": 1,
+    "reconciled_runs": 1,
+    "required_runs": 1,
+    "recovery_samples": 282,
+    "recovery_p99_ns": 16084331817,
+    "recovery_target_exclusive_ns": 5000000000
+  },
+  "replay": {
+    "evidence_valid": true,
+    "qualified": true,
+    "decisions": 50000,
+    "clean_process_replays": 3,
+    "byte_match_percent": 100
+  },
+  "operations": {
+    "evidence_valid": true,
+    "qualified": true,
+    "workflow_jobs": 3,
+    "audit_events": 6,
+    "deterministic_rules_validated": true
+  },
+  "slo": {
+    "evidence_valid": true,
+    "qualified": true,
+    "alerts": 2,
+    "fire_and_recovery_cases": 2,
+    "p5_evidence_linked": true
+  },
+  "measured_misses": [
+    "throughput 9807.3495921051872 is below 10000 durable lease grants per minute",
+    "worker reassignment p99 16084331817ns is not below 5000000000ns"
+  ]
+}

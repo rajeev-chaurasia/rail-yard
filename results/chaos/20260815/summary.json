@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "evidence_valid": true,
+  "scope": {
+    "runs": 1,
+    "jobs": 5000,
+    "worker_kills": 20,
+    "server_kills": 1,
+    "seed": 26081401,
+    "payload_duration": "10s"
+  },
+  "correctness": {
+    "reconciliation_passed": true,
+    "lost": 0,
+    "duplicate_canonical_outcomes": 0
+  },
+  "recovery": {
+    "samples": 282,
+    "p99_ns": 16084331817,
+    "target_exclusive_ns": 5000000000,
+    "target_met": false
+  },
+  "status": "measured_miss"
+}

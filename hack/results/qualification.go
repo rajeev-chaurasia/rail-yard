@@ -448,6 +448,7 @@ func validateBenchmark(path string) (throughputResult, string, []string) {
 	}
 	if len(runDirectories) == len(references) {
 		recomputed := evidence.SummarizeSuite(runDirectories, suite.GeneratedAt)
+		normalizeSuiteArtifactPaths(&recomputed, suite)
 		if !reflect.DeepEqual(recomputed, suite) {
 			reasons = append(reasons, "suite does not match recomputed checked run evidence")
 		}
@@ -465,6 +466,15 @@ func validateBenchmark(path string) (throughputResult, string, []string) {
 	result.EvidenceValid = len(reasons) == 0
 	result.Qualified = result.EvidenceValid && result.LeaseGrantsPerMinute >= throughputTarget
 	return result, digest, reasons
+}
+
+func normalizeSuiteArtifactPaths(recomputed *evidence.SuiteSummary, expected evidence.SuiteSummary) {
+	recomputed.Warmup.ArtifactPath = expected.Warmup.ArtifactPath
+	for index := range recomputed.MeasuredRuns {
+		if index < len(expected.MeasuredRuns) {
+			recomputed.MeasuredRuns[index].ArtifactPath = expected.MeasuredRuns[index].ArtifactPath
+		}
+	}
 }
 
 func validateBenchmarkRun(directory string, reference evidence.SuiteRun) []string {

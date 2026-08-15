@@ -375,6 +375,24 @@ func completedSummary(cfg config, run int, seed int64, directory string) runSumm
 	}
 }
 
+func TestArtifactFilesExcludeMutableSQLiteSharedMemory(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "stable.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "railyard.db-shm"), []byte("mutable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := artifactFiles(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0] != "stable.json" {
+		t.Fatalf("artifact files = %v, want stable.json only", files)
+	}
+}
+
 func rewriteChecksums(t *testing.T, runDirectory string, cfg config) {
 	t.Helper()
 	if err := os.Remove(filepath.Join(runDirectory, checksumFile)); err != nil {

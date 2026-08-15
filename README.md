@@ -5,9 +5,9 @@ control-plane problems behind developer platforms: durable scheduling,
 event-driven triggers, leases and heartbeats, admission control, deterministic
 replay, and failure-oriented testing.
 
-The project is intentionally measured rather than marketed. The performance and
-correctness figures below are targets until a qualification run commits the raw
-evidence. Resume material will use only measured results.
+The project is intentionally measured rather than marketed. Qualification
+evidence is committed below, including results that missed their targets.
+Resume material must use only measured results with the documented scope.
 
 ## Status
 
@@ -15,8 +15,8 @@ evidence. Resume material will use only measured results.
 - [x] Durable state machine, worker protocol, and leases
 - [x] DAG scheduler, triggers, retries, and dead-letter queue
 - [x] Deterministic replay harness
-- [ ] Full chaos qualification campaign
-- [ ] Qualified benchmarks and measured results
+- [x] Reduced chaos qualification and measured results
+- [x] Reduced benchmark qualification and measured results
 - [x] Operations API, internal dashboard, audit trail, SLO rules, and harnesses
 
 ## Correctness contract
@@ -164,10 +164,9 @@ actor-aware audit trail, and explicit SLO alerting.
 - Alert when fewer than 99% of ready jobs start within five seconds or when the
   dead-letter queue exceeds its documented threshold.
 
-Every `/v1/operations` mutation requires `X-Rail-Yard-Actor` and an
-`Idempotency-Key`. Dashboard mutations require an actor in the JSON body plus
-the dashboard CSRF cookie and header. The older `/v1` mutation routes are not
-actor-attributed, so they are not the operator audit surface.
+Every mutation route requires `X-Rail-Yard-Actor` and an `Idempotency-Key`.
+Dashboard mutations require an actor in the JSON body plus the dashboard CSRF
+cookie and header.
 
 Gate: complete a recorded DAG lifecycle through the API and dashboard, then
 prove both SLO alerts fire and recover in deterministic promtool rule tests.
@@ -206,6 +205,29 @@ reviewed, complete evidence set with the required manifests, raw samples,
 reconciliation, and checksums may be promoted to a published result directory.
 If a result misses a target, the measured number will be published unchanged.
 
+## Measured portfolio results
+
+Evidence set: [results/qualification/20260815](results/qualification/20260815)
+
+1. **Throughput:** three measured 5,000-job runs produced a median of
+   **9,807.35 durable lease grants/min** on one host with eight worker
+   processes at 256 slots each. The 10,000/min target was missed by 1.93%.
+2. **Chaos correctness:** one seeded 5,000-job run with 20 worker kills and one
+   server kill reconciled with **zero lost** and **zero duplicate canonical
+   outcomes**.
+3. **Recovery:** **16.084s p99** across 282 affected-lease samples. The
+   five-second target was missed.
+4. **Determinism:** three separate processes replayed 50,000 decisions with
+   **100% byte match** and SHA-256
+   `06ea0a236743ed4a9782879f9fff78242fd6e29da24ed78cc9c90e46a6376bdf`.
+5. **Operations:** the live DAG, worker reassignment, DLQ redrive, and
+   actor-audit lifecycle passed with six audit events.
+6. **SLO rules:** both alerts passed deterministic promtool fire-and-recovery
+   tests.
+
+The evidence is valid, but the combined qualification status is a measured
+miss because throughput and recovery did not meet their targets.
+
 ## Technology
 
 - Go, standard library HTTP/JSON, and `os/exec`
@@ -230,7 +252,7 @@ The system is designed to run locally without cloud spend.
 
 ## Resume activation
 
-Once reduced portfolio qualification evidence is committed, send:
+Only after every target is met, send:
 
 ```text
 built: railyard
@@ -238,5 +260,6 @@ built: railyard
 
 with the measured no-op scheduling rate, chaos reconciliation result, worker
 reassignment p99 and sample count, and replay match percentage. Claims must
-state the 5,000-job benchmark and single 5,000-job chaos scope. Until then, this
-repository describes work in progress rather than verified resume evidence.
+state the 5,000-job benchmark and single 5,000-job chaos scope. The current
+evidence is verified but does not activate this phrase because two targets
+missed.

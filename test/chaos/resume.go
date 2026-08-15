@@ -612,7 +612,7 @@ func artifactFiles(runDirectory string) ([]string, error) {
 			return err
 		}
 		relative = filepath.ToSlash(relative)
-		if relative != checksumFile {
+		if relative != checksumFile && !strings.HasSuffix(relative, "-shm") {
 			files = append(files, relative)
 		}
 		return nil

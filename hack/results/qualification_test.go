@@ -15,6 +15,34 @@ import (
 	"github.com/rajeev-chaurasia/rail-yard/test/reconcile"
 )
 
+func TestNormalizeSuiteArtifactPathsPreservesPublishedReferences(t *testing.T) {
+	expected := evidence.SuiteSummary{
+		Warmup: evidence.SuiteRun{ArtifactPath: "runs/warmup"},
+		MeasuredRuns: []evidence.SuiteRun{
+			{ArtifactPath: "runs/measured-01"},
+			{ArtifactPath: "runs/measured-02"},
+		},
+	}
+	recomputed := evidence.SuiteSummary{
+		Warmup: evidence.SuiteRun{ArtifactPath: `C:\absolute\warmup`},
+		MeasuredRuns: []evidence.SuiteRun{
+			{ArtifactPath: `C:\absolute\measured-01`},
+			{ArtifactPath: `C:\absolute\measured-02`},
+		},
+	}
+
+	normalizeSuiteArtifactPaths(&recomputed, expected)
+
+	if recomputed.Warmup.ArtifactPath != expected.Warmup.ArtifactPath {
+		t.Fatalf("warmup path = %q", recomputed.Warmup.ArtifactPath)
+	}
+	for index := range expected.MeasuredRuns {
+		if recomputed.MeasuredRuns[index].ArtifactPath != expected.MeasuredRuns[index].ArtifactPath {
+			t.Fatalf("measured path %d = %q", index, recomputed.MeasuredRuns[index].ArtifactPath)
+		}
+	}
+}
+
 func TestValidateReplayDoesNotRoundMissIntoCompliance(t *testing.T) {
 	t.Parallel()
 

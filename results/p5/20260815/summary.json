@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "evidence_valid": true,
+  "duration_seconds": 72.433,
+  "workflow_jobs": 3,
+  "worker_reassignment_observed": true,
+  "dead_letter_redrive_passed": true,
+  "audit_events": 6,
+  "live_alert_waits_skipped": true,
+  "deterministic_slo_rules": {
+    "alerts": 2,
+    "fire_and_recovery_cases": 2,
+    "promtool_passed": true
+  },
+  "checksums_verified": true,
+  "passed": true
+}

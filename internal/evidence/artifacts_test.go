@@ -20,6 +20,9 @@ func TestArtifactChecksums(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "logs", "run.log"), []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "snapshot.db-shm"), []byte("mutable"), 0o644); err != nil {
+		t.Fatalf("write SHM: %v", err)
+	}
 	if err := GenerateChecksums(root); err != nil {
 		t.Fatalf("GenerateChecksums: %v", err)
 	}
@@ -33,6 +36,9 @@ func TestArtifactChecksums(t *testing.T) {
 	}
 	if !strings.Contains(string(checksums), "logs/run.log") {
 		t.Fatalf("checksums do not use slash-separated paths:\n%s", checksums)
+	}
+	if strings.Contains(string(checksums), "snapshot.db-shm") {
+		t.Fatalf("checksums include mutable SQLite SHM:\n%s", checksums)
 	}
 }
 
@@ -87,6 +93,9 @@ func TestSQLiteSnapshotDigestsIncludeWAL(t *testing.T) {
 	}
 	if err := os.WriteFile(database+"-wal", []byte("wal"), 0o644); err != nil {
 		t.Fatalf("write WAL: %v", err)
+	}
+	if err := os.WriteFile(database+"-shm", []byte("mutable"), 0o644); err != nil {
+		t.Fatalf("write SHM: %v", err)
 	}
 
 	digests, err := SQLiteSnapshotDigests(database)

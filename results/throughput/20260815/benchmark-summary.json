@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "valid": true,
+  "generated_at": "2026-08-14T22:50:15.1286441Z",
+  "scope": {
+    "warmup_runs": 1,
+    "measured_runs": 3,
+    "jobs_per_run": 5000,
+    "worker_processes": 8,
+    "slots_per_worker": 256
+  },
+  "admissions": {
+    "samples_per_minute": [
+      9737.07413411106,
+      9816.136247291835,
+      12057.609149812333
+    ],
+    "median_per_minute": 9816.136247291835
+  },
+  "durable_lease_grants": {
+    "samples_per_minute": [
+      9733.429542777405,
+      9807.349592105187,
+      12046.830998759662
+    ],
+    "median_per_minute": 9807.349592105187
+  },
+  "successful_completions": {
+    "samples_per_minute": [
+      9753.114941072075,
+      9823.743898197805,
+      12058.21292665408
+    ],
+    "median_per_minute": 9823.743898197805
+  },
+  "admission_to_first_lease": {
+    "count": 15000,
+    "p50_ns": 19838812,
+    "p95_ns": 63772094,
+    "p99_ns": 86080965,
+    "max_ns": 94482616
+  },
+  "completion_lease_to_completion": {
+    "count": 15000,
+    "p50_ns": 64698315,
+    "p95_ns": 228872737,
+    "p99_ns": 367247991,
+    "max_ns": 647484616
+  },
+  "end_to_end": {
+    "count": 15000,
+    "p50_ns": 97896124,
+    "p95_ns": 251024694,
+    "p99_ns": 384230860,
+    "max_ns": 675493405
+  },
+  "target_per_minute": 10000,
+  "target_met": false
+}
