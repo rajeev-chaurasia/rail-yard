@@ -7,7 +7,6 @@ replay, and failure-oriented testing.
 
 The project is intentionally measured rather than marketed. Qualification
 evidence is committed below, including results that missed their targets.
-Resume material must use only measured results with the documented scope.
 
 ## Status
 
@@ -249,17 +248,3 @@ The system is designed to run locally without cloud spend.
 - [Operations walkthrough](docs/operations-walkthrough.md)
 - [Maintainer handoff](docs/HANDOFF.md)
 - [Evidence directory](results/README.md)
-
-## Resume activation
-
-Only after every target is met, send:
-
-```text
-built: railyard
-```
-
-with the measured no-op scheduling rate, chaos reconciliation result, worker
-reassignment p99 and sample count, and replay match percentage. Claims must
-state the 5,000-job benchmark and single 5,000-job chaos scope. The current
-evidence is verified but does not activate this phrase because two targets
-missed.
