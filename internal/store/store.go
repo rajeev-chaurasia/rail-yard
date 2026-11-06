@@ -30,7 +30,7 @@ type Store interface {
 	SubmitJob(context.Context, Submission, time.Time) (domain.Job, bool, error)
 	SubmitWorkflow(context.Context, WorkflowSubmission, time.Time) ([]domain.Job, bool, error)
 	GetJob(context.Context, string) (domain.Job, error)
-	RegisterWorker(context.Context, string, int, time.Time) error
+	RegisterWorker(context.Context, string, int, string, time.Time) ([]domain.ReapedLease, error)
 	HeartbeatWorker(context.Context, string, time.Time) error
 	Acquire(context.Context, string, int, int, time.Time, time.Duration) ([]domain.Lease, error)
 	MarkRunning(context.Context, string, domain.LeaseRef, time.Time) error

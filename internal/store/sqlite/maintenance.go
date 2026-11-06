@@ -159,6 +159,40 @@ func (s *Store) ReapExpired(
 	}
 	defer rollback(tx)
 
+	expired, err := selectLiveAttempts(
+		ctx,
+		tx,
+		`a.expires_at <= ? ORDER BY a.expires_at ASC, a.job_id ASC LIMIT ?`,
+		timeToDB(now),
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	reaped, err := reapAttempts(ctx, tx, expired, now, leaseExpiredMessage)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expired lease reap: %w", err)
+	}
+	return reaped, nil
+}
+
+const (
+	leaseExpiredMessage    = "worker lease expired before completion"
+	workerRestartedMessage = "worker restarted before completion"
+)
+
+// selectLiveAttempts reads current-generation leases whose job is still
+// scheduled or running. The filter is appended to a fixed WHERE clause so
+// expiry reaping and restart fencing judge liveness identically.
+func selectLiveAttempts(
+	ctx context.Context,
+	tx *sql.Tx,
+	filter string,
+	args ...any,
+) ([]expiredAttempt, error) {
 	rows, err := tx.QueryContext(
 		ctx,
 		`SELECT
@@ -170,18 +204,15 @@ func (s *Store) ReapExpired(
 		  AND j.attempt_no = a.attempt_no
 		  AND j.lease_generation = a.lease_generation
 		 WHERE a.state IN ('LEASED', 'RUNNING')
-		   AND a.expires_at <= ?
 		   AND j.state IN ('SCHEDULED', 'RUNNING')
-		 ORDER BY a.expires_at ASC, a.job_id ASC
-		 LIMIT ?`,
-		timeToDB(now),
-		limit,
+		   AND `+filter,
+		args...,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("select expired leases: %w", err)
+		return nil, fmt.Errorf("select live leases: %w", err)
 	}
 
-	expired := make([]expiredAttempt, 0, limit)
+	var attempts []expiredAttempt
 	for rows.Next() {
 		var attempt expiredAttempt
 		var retryJSON string
@@ -199,24 +230,33 @@ func (s *Store) ReapExpired(
 			&retryJSON,
 		); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("scan expired lease: %w", err)
+			return nil, fmt.Errorf("scan live lease: %w", err)
 		}
 		if err := json.Unmarshal([]byte(retryJSON), &attempt.retry); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("decode expired lease retry policy: %w", err)
+			return nil, fmt.Errorf("decode live lease retry policy: %w", err)
 		}
-		expired = append(expired, attempt)
+		attempts = append(attempts, attempt)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close expired leases: %w", err)
+		return nil, fmt.Errorf("close live leases: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate expired leases: %w", err)
+		return nil, fmt.Errorf("iterate live leases: %w", err)
 	}
+	return attempts, nil
+}
 
-	reaped := make([]domain.ReapedLease, 0, len(expired))
-	for _, attempt := range expired {
-		if err := reapAttempt(ctx, tx, attempt, now); err != nil {
+func reapAttempts(
+	ctx context.Context,
+	tx *sql.Tx,
+	attempts []expiredAttempt,
+	now time.Time,
+	message string,
+) ([]domain.ReapedLease, error) {
+	reaped := make([]domain.ReapedLease, 0, len(attempts))
+	for _, attempt := range attempts {
+		if err := reapAttempt(ctx, tx, attempt, now, message); err != nil {
 			return nil, err
 		}
 		nextAvailableAt := now.UTC()
@@ -231,10 +271,6 @@ func (s *Store) ReapExpired(
 			NextAvailableAt: nextAvailableAt,
 		})
 	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit expired lease reap: %w", err)
-	}
 	return reaped, nil
 }
 
@@ -243,10 +279,11 @@ func reapAttempt(
 	tx *sql.Tx,
 	attempt expiredAttempt,
 	now time.Time,
+	message string,
 ) error {
 	failure := &domain.Failure{
 		Class:   "lease_expired",
-		Message: "worker lease expired before completion",
+		Message: message,
 	}
 	failureJSON, err := encodeOptionalFailure(failure)
 	if err != nil {

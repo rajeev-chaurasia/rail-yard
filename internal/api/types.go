@@ -56,8 +56,9 @@ type RedriveDeadLetterResponse struct {
 }
 
 type RegisterWorkerRequest struct {
-	WorkerID string `json:"worker_id"`
-	Slots    int    `json:"slots"`
+	WorkerID    string `json:"worker_id"`
+	Slots       int    `json:"slots"`
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 type RegisterWorkerResponse struct {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/rajeev-chaurasia/rail-yard/internal/domain"
 	"github.com/rajeev-chaurasia/rail-yard/internal/operations"
 	storepkg "github.com/rajeev-chaurasia/rail-yard/internal/store"
 )
@@ -18,7 +20,7 @@ func TestWorkerRegistrationSurvivesRestartAndReportsIdleHealth(t *testing.T) {
 	registeredAt := time.Date(2026, time.August, 14, 18, 0, 0, 0, time.UTC)
 
 	first := openTestStore(t, path)
-	if err := first.RegisterWorker(ctx, "worker-idle", 8, registeredAt); err != nil {
+	if _, err := first.RegisterWorker(ctx, "worker-idle", 8, "", registeredAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -37,7 +39,7 @@ func TestWorkerRegistrationSurvivesRestartAndReportsIdleHealth(t *testing.T) {
 		t.Fatalf("idle worker health = %+v", health)
 	}
 
-	if err := second.RegisterWorker(ctx, "worker-idle", 8, registeredAt.Add(time.Minute)); err != nil {
+	if _, err := second.RegisterWorker(ctx, "worker-idle", 8, "", registeredAt.Add(time.Minute)); err != nil {
 		t.Fatalf("idempotent registration: %v", err)
 	}
 	var storedRegistration int64
@@ -51,10 +53,11 @@ func TestWorkerRegistrationSurvivesRestartAndReportsIdleHealth(t *testing.T) {
 	if got := timeFromDB(storedRegistration); !got.Equal(registeredAt) {
 		t.Fatalf("registration time = %s, want %s", got, registeredAt)
 	}
-	if err := second.RegisterWorker(
+	if _, err := second.RegisterWorker(
 		ctx,
 		"worker-idle",
 		4,
+		"",
 		registeredAt.Add(2*time.Minute),
 	); !errors.Is(err, storepkg.ErrWorkerCapacityConflict) {
 		t.Fatalf("capacity conflict error = %v", err)
@@ -67,7 +70,7 @@ func TestWorkerHeartbeatHealthTransitionsAndActiveCapacity(t *testing.T) {
 	t.Cleanup(func() { _ = jobStore.Close() })
 	now := time.Date(2026, time.August, 14, 19, 0, 0, 0, time.UTC)
 
-	if err := jobStore.RegisterWorker(ctx, "worker-health", 6, now); err != nil {
+	if _, err := jobStore.RegisterWorker(ctx, "worker-health", 6, "", now); err != nil {
 		t.Fatal(err)
 	}
 	if status := workerHealthAt(t, jobStore, now.Add(31*time.Second)).Status; status != operations.WorkerStale {
@@ -112,7 +115,8 @@ func TestConcurrentWorkerRegistrationKeepsOneCapacity(t *testing.T) {
 		go func() {
 			defer wait.Done()
 			<-start
-			errs <- jobStore.RegisterWorker(ctx, "worker-race", capacity, now)
+			_, err := jobStore.RegisterWorker(ctx, "worker-race", capacity, "", now)
+			errs <- err
 		}()
 	}
 	close(start)
@@ -150,4 +154,114 @@ func workerHealthAt(t *testing.T, jobStore *Store, now time.Time) operations.Wor
 		t.Fatalf("worker health rows = %d, want 1", len(values))
 	}
 	return values[0]
+}
+
+func TestNewWorkerIncarnationFencesPredecessorLeases(t *testing.T) {
+	ctx := context.Background()
+	jobStore := openTestStore(t, filepath.Join(t.TempDir(), "incarnation.db"))
+	t.Cleanup(func() { _ = jobStore.Close() })
+	now := time.Date(2026, time.November, 6, 9, 0, 0, 0, time.UTC)
+
+	if _, err := jobStore.RegisterWorker(ctx, "worker-a", 4, "first", now); err != nil {
+		t.Fatal(err)
+	}
+	submitTestJob(t, jobStore, "fence-1", "digest-fence-1", now)
+	submitTestJob(t, jobStore, "fence-2", "digest-fence-2", now)
+	killed := []domain.Lease{
+		acquireOne(t, jobStore, "worker-a", now, time.Minute),
+		acquireOne(t, jobStore, "worker-a", now, time.Minute),
+	}
+
+	fenced, err := jobStore.RegisterWorker(ctx, "worker-a", 4, "first", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fenced) != 0 {
+		t.Fatalf("same incarnation fenced %+v, want nothing", fenced)
+	}
+
+	restartedAt := now.Add(2 * time.Second)
+	fenced, err = jobStore.RegisterWorker(ctx, "worker-a", 4, "second", restartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fenced) != len(killed) {
+		t.Fatalf("fenced %d leases, want %d: %+v", len(fenced), len(killed), fenced)
+	}
+	for _, value := range fenced {
+		if value.OldWorkerID != "worker-a" || !value.NextAvailableAt.Equal(restartedAt) {
+			t.Fatalf("fenced lease = %+v", value)
+		}
+	}
+	for _, lease := range killed {
+		job, err := jobStore.GetJob(ctx, lease.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.State != domain.StatePending {
+			t.Fatalf("job %s state = %s, want PENDING", lease.JobID, job.State)
+		}
+		var attemptState, failureJSON string
+		if err := jobStore.db.QueryRowContext(
+			ctx,
+			"SELECT state, failure_json FROM attempts WHERE job_id = ? AND lease_generation = ?",
+			lease.JobID,
+			lease.Generation,
+		).Scan(&attemptState, &failureJSON); err != nil {
+			t.Fatal(err)
+		}
+		if attemptState != "EXPIRED" || !strings.Contains(failureJSON, workerRestartedMessage) {
+			t.Fatalf("killed attempt state=%s failure=%s", attemptState, failureJSON)
+		}
+	}
+
+	successor := acquireOne(t, jobStore, "worker-a", restartedAt, time.Minute)
+	if successor.Generation <= killed[0].Generation && successor.Generation <= killed[1].Generation {
+		t.Fatalf("successor generation %d does not advance past killed leases", successor.Generation)
+	}
+	_, err = jobStore.Complete(ctx, domain.Completion{
+		LeaseRef: leaseRef(killed[0]),
+		WorkerID: "worker-a",
+		Success:  true,
+	}, restartedAt.Add(time.Millisecond))
+	if !errors.Is(err, domain.ErrStaleLease) {
+		t.Fatalf("predecessor completion error = %v, want stale lease", err)
+	}
+
+	fenced, err = jobStore.RegisterWorker(ctx, "worker-a", 4, "second", restartedAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fenced) != 0 {
+		t.Fatalf("re-registration by the restarted process fenced its own leases: %+v", fenced)
+	}
+}
+
+func TestRegistrationWithoutIncarnationNeverFences(t *testing.T) {
+	ctx := context.Background()
+	jobStore := openTestStore(t, filepath.Join(t.TempDir(), "legacy-incarnation.db"))
+	t.Cleanup(func() { _ = jobStore.Close() })
+	now := time.Date(2026, time.November, 6, 10, 0, 0, 0, time.UTC)
+
+	if _, err := jobStore.RegisterWorker(ctx, "worker-a", 2, "", now); err != nil {
+		t.Fatal(err)
+	}
+	submitTestJob(t, jobStore, "legacy", "digest-legacy", now)
+	acquireOne(t, jobStore, "worker-a", now, time.Minute)
+
+	for index, incarnation := range []string{"upgraded", "", "upgraded"} {
+		fenced, err := jobStore.RegisterWorker(
+			ctx,
+			"worker-a",
+			2,
+			incarnation,
+			now.Add(time.Duration(index+1)*time.Second),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fenced) != 0 {
+			t.Fatalf("registration %d with incarnation %q fenced %+v", index, incarnation, fenced)
+		}
+	}
 }

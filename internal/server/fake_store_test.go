@@ -18,7 +18,7 @@ type fakeStore struct {
 		time.Time,
 	) ([]domain.Job, bool, error)
 	getJob           func(context.Context, string) (domain.Job, error)
-	registerWorker   func(context.Context, string, int, time.Time) error
+	registerWorker   func(context.Context, string, int, string, time.Time) ([]domain.ReapedLease, error)
 	heartbeatWorker  func(context.Context, string, time.Time) error
 	acquire          func(context.Context, string, int, int, time.Time, time.Duration) ([]domain.Lease, error)
 	markRunning      func(context.Context, string, domain.LeaseRef, time.Time) error
@@ -90,12 +90,13 @@ func (f *fakeStore) RegisterWorker(
 	ctx context.Context,
 	workerID string,
 	capacitySlots int,
+	incarnation string,
 	now time.Time,
-) error {
+) ([]domain.ReapedLease, error) {
 	if f.registerWorker == nil {
-		return nil
+		return []domain.ReapedLease{}, nil
 	}
-	return f.registerWorker(ctx, workerID, capacitySlots, now)
+	return f.registerWorker(ctx, workerID, capacitySlots, incarnation, now)
 }
 
 func (f *fakeStore) HeartbeatWorker(

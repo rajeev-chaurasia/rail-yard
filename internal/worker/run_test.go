@@ -451,7 +451,9 @@ func TestWorkerReregistersAfterAcquireLosesRegistration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := runWorker(worker, ctx)
 	initialRegistration := receive(t, protocol.registerRequests)
-	if initialRegistration.WorkerID != "worker-1" || initialRegistration.Slots != 3 {
+	if initialRegistration.WorkerID != "worker-1" ||
+		initialRegistration.Slots != 3 ||
+		initialRegistration.Incarnation == "" {
 		t.Fatalf("initial registration = %+v", initialRegistration)
 	}
 	_ = receive(t, protocol.acquireRequests)
@@ -481,6 +483,15 @@ func TestWorkerReregistersAfterAcquireLosesRegistration(t *testing.T) {
 	cancel()
 	if err := receive(t, runDone); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWorkerProcessesHaveDistinctIncarnations(t *testing.T) {
+	config := Config{WorkerID: "worker-1", Slots: 1}
+	first := newTestWorker(t, newFakeProtocol(), newBlockingExecutor(), newManualTicker(), config)
+	second := newTestWorker(t, newFakeProtocol(), newBlockingExecutor(), newManualTicker(), config)
+	if first.incarnation == "" || first.incarnation == second.incarnation {
+		t.Fatalf("incarnations %q and %q must be distinct and non-empty", first.incarnation, second.incarnation)
 	}
 }
 

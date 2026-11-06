@@ -178,7 +178,9 @@ The current forward-only sequence is:
 3. `003_operation_scope.sql`, tenant and action scoped operation idempotency,
    with existing rows backfilled from their targets or assigned to `default`
    when no target tenant can be resolved; and
-4. `004_workers.sql`, durable worker registrations.
+4. `004_workers.sql`, durable worker registrations; and
+5. `005_worker_incarnation.sql`, the process incarnation recorded with each
+   worker registration.
 
 Startup stores each migration's name and SHA-256 checksum in
 `schema_migrations`. A changed checksum for an applied version prevents startup.
@@ -244,6 +246,19 @@ batches for large fan-out graphs.
 Workers heartbeat every second. A lease expires 2.5 seconds after its latest
 successful heartbeat. The reaper scans every 250 milliseconds and also runs
 immediately at server startup.
+
+Each worker process generates a random incarnation at startup and sends it on
+every registration. When a registration for a known worker ID carries a
+different non-empty incarnation, the earlier process is gone, so its current
+leases are expired and requeued as recovery work in the registration
+transaction rather than 1.5 to 2.5 seconds later by the reaper. The restarted
+process registers with the same slot capacity, so it can absorb its own lost
+work before it competes for backlog. A repeat registration from the same
+process, such as after a control-plane restart, keeps its leases. Generation
+fencing still rejects any late heartbeat or completion from the earlier
+process. Two live processes sharing one worker ID would fence each other's
+leases on every restart, which wastes work but cannot produce a duplicate
+canonical outcome.
 
 Workers with more than one slot reserve 25% of capacity for successor leases.
 Normal work cannot consume that reserve, while recovery work can use every

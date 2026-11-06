@@ -469,6 +469,8 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request, jobID stri
 	writeJSON(w, http.StatusOK, job)
 }
 
+const maxIncarnationLength = 128
+
 func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	var request api.RegisterWorkerRequest
 	if requestError := s.decodeJSON(w, r, &request); requestError != nil {
@@ -477,6 +479,13 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateWorkerID(request.WorkerID); err != nil {
 		writeHTTPError(w, invalidRequest(err.Error()))
+		return
+	}
+	if len(request.Incarnation) > maxIncarnationLength {
+		writeHTTPError(w, invalidRequest(fmt.Sprintf(
+			"incarnation must be at most %d bytes",
+			maxIncarnationLength,
+		)))
 		return
 	}
 	if request.Slots < 1 || request.Slots > s.config.MaxWorkerSlots {
@@ -488,7 +497,9 @@ func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.config.Now().UTC()
-	if err := s.store.RegisterWorker(r.Context(), request.WorkerID, request.Slots, now); err != nil {
+	if _, err := s.store.RegisterWorker(
+		r.Context(), request.WorkerID, request.Slots, request.Incarnation, now,
+	); err != nil {
 		if errors.Is(err, store.ErrWorkerCapacityConflict) {
 			writeHTTPError(w, &httpError{
 				status:  http.StatusConflict,

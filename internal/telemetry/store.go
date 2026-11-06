@@ -52,9 +52,14 @@ func (s *ObservedStore) RegisterWorker(
 	ctx context.Context,
 	workerID string,
 	capacitySlots int,
+	incarnation string,
 	now time.Time,
-) error {
-	return s.next.RegisterWorker(ctx, workerID, capacitySlots, now)
+) ([]domain.ReapedLease, error) {
+	values, err := s.next.RegisterWorker(ctx, workerID, capacitySlots, incarnation, now)
+	if err == nil {
+		s.recordReaped(values)
+	}
+	return values, err
 }
 
 func (s *ObservedStore) HeartbeatWorker(
@@ -226,17 +231,21 @@ func (s *ObservedStore) ReapExpired(
 	values, err := s.next.ReapExpired(ctx, now, limit)
 	s.observeSQLite(SQLiteReapExpired, started, err)
 	if err == nil {
-		for _, value := range values {
-			if value.NextAvailableAt.IsZero() {
-				s.metrics.RecordLeaseExpiration(LeaseDeadLettered)
-				s.metrics.RecordDeadLetter(DeadLetterRetriesExhausted)
-			} else {
-				s.metrics.RecordLeaseExpiration(LeaseRequeued)
-				s.metrics.RecordRetry(RetryLeaseExpired)
-			}
-		}
+		s.recordReaped(values)
 	}
 	return values, err
+}
+
+func (s *ObservedStore) recordReaped(values []domain.ReapedLease) {
+	for _, value := range values {
+		if value.NextAvailableAt.IsZero() {
+			s.metrics.RecordLeaseExpiration(LeaseDeadLettered)
+			s.metrics.RecordDeadLetter(DeadLetterRetriesExhausted)
+		} else {
+			s.metrics.RecordLeaseExpiration(LeaseRequeued)
+			s.metrics.RecordRetry(RetryLeaseExpired)
+		}
+	}
 }
 
 func (s *ObservedStore) Close() error {

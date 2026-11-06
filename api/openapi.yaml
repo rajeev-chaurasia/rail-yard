@@ -1469,6 +1469,16 @@ components:
           type: integer
           minimum: 1
           maximum: 1024
+        incarnation:
+          type: string
+          maxLength: 128
+          description: >-
+            Opaque identifier generated once per worker process. When a
+            registration carries a different non-empty incarnation than the
+            one stored for this worker ID, the previous process is treated as
+            dead and its live leases are requeued immediately instead of
+            waiting for lease expiry. Repeat registrations from the same
+            process keep their leases. An empty value never requeues.
     RegisterWorkerResponse:
       type: object
       additionalProperties: false

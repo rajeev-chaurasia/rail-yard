@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -108,10 +110,11 @@ func WithTickerFactory(factory TickerFactory) Option {
 }
 
 type Worker struct {
-	protocol  Protocol
-	executor  executor.Executor
-	config    Config
-	newTicker TickerFactory
+	protocol    Protocol
+	executor    executor.Executor
+	config      Config
+	newTicker   TickerFactory
+	incarnation string
 }
 
 func New(protocol Protocol, runner executor.Executor, config Config, options ...Option) (*Worker, error) {
@@ -126,6 +129,10 @@ func New(protocol Protocol, runner executor.Executor, config Config, options ...
 		return nil, err
 	}
 
+	incarnation, err := newIncarnation()
+	if err != nil {
+		return nil, err
+	}
 	result := &Worker{
 		protocol: protocol,
 		executor: runner,
@@ -133,6 +140,7 @@ func New(protocol Protocol, runner executor.Executor, config Config, options ...
 		newTicker: func(duration time.Duration) Ticker {
 			return &realTicker{ticker: time.NewTicker(duration)}
 		},
+		incarnation: incarnation,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -144,8 +152,9 @@ func New(protocol Protocol, runner executor.Executor, config Config, options ...
 
 func (w *Worker) Run(ctx context.Context) error {
 	registration, err := w.protocol.Register(ctx, api.RegisterWorkerRequest{
-		WorkerID: w.config.WorkerID,
-		Slots:    w.config.Slots,
+		WorkerID:    w.config.WorkerID,
+		Slots:       w.config.Slots,
+		Incarnation: w.incarnation,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -207,8 +216,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		go func() {
 			defer goroutines.Done()
 			response, registerErr := w.protocol.Register(ctx, api.RegisterWorkerRequest{
-				WorkerID: workerID,
-				Slots:    w.config.Slots,
+				WorkerID:    workerID,
+				Slots:       w.config.Slots,
+				Incarnation: w.incarnation,
 			})
 			if registerErr == nil && response.WorkerID != "" && response.WorkerID != workerID {
 				registerErr = fmt.Errorf(
@@ -942,4 +952,15 @@ func retryableProtocolError(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) &&
 		(apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= http.StatusInternalServerError)
+}
+
+// newIncarnation identifies this process so the server can tell a restart
+// under the same worker ID, whose old leases are certainly dead, from a
+// re-registration by a process that still holds them.
+func newIncarnation() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate worker incarnation: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
 }

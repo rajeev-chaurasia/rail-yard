@@ -30,7 +30,8 @@ independent reconciliation tool, and deterministic replay.
     duplicate returns `409`.
 13. Slot reservations are acquired and released in the same transaction as the
     state transition that owns them.
-14. Reaping expires only the current lease generation.
+14. Reaping expires only the current lease generation. Registration by a new
+    process incarnation reaps the worker's current generations immediately.
 
 ## DAGs
 

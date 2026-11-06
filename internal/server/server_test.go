@@ -309,10 +309,11 @@ func TestEmptyHeartbeatRefreshesIdleWorker(t *testing.T) {
 			_ context.Context,
 			workerID string,
 			capacitySlots int,
+			_ string,
 			now time.Time,
-		) error {
+		) ([]domain.ReapedLease, error) {
 			registered = workerID == "worker-idle" && capacitySlots == 4 && now.Equal(testNow)
-			return nil
+			return nil, nil
 		},
 		heartbeatWorker: func(
 			_ context.Context,
@@ -379,16 +380,17 @@ func TestWorkerRegistrationCapacityConflict(t *testing.T) {
 			_ context.Context,
 			_ string,
 			requested int,
+			_ string,
 			_ time.Time,
-		) error {
+		) ([]domain.ReapedLease, error) {
 			if capacity == 0 {
 				capacity = requested
-				return nil
+				return nil, nil
 			}
 			if capacity != requested {
-				return store.ErrWorkerCapacityConflict
+				return nil, store.ErrWorkerCapacityConflict
 			}
-			return nil
+			return nil, nil
 		},
 	}
 	server := newTestServer(t, jobStore, nil)
