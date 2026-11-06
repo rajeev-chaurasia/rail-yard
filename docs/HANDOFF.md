@@ -22,10 +22,10 @@ Final evidence status:
 
 ```text
 Evidence validity: valid
-Combined qualification: measured miss
+Combined qualification: measured miss (throughput)
 Benchmark median: 9,807.35 durable lease grants/min
 Chaos correctness: zero lost, zero duplicate canonical outcomes
-Recovery: 16.084s p99 across 282 samples
+Recovery: 0.640s p99 across 296 samples (results/chaos/20261106)
 Replay: 50,000 decisions, 3 processes, 100% byte match
 P5 lifecycle: passed
 SLO rule tests: passed
@@ -49,6 +49,8 @@ No qualification stack should remain active after handoff.
 - fenced leases and monotonic lease generations
 - one-second heartbeats
 - 2.5-second default recovery lease
+- per-process worker incarnations; a restarted worker's leases are requeued
+  at registration instead of after expiry
 - priority reaping and reserved recovery capacity
 - deterministic retries and DLQ insertion
 - cron and Redis Streams triggers
@@ -397,11 +399,20 @@ results/_work/benchmark-<short commit>
 1 server kill
 0 lost
 0 duplicate canonical outcomes
-16.084s recovery p99
-282 recovery samples
+0.640s recovery p99
+296 recovery samples
 ```
 
-Correctness passed. The five-second recovery target was missed.
+Correctness passed and the five-second recovery target was met. Evidence:
+`results/chaos/20261106`, measured at commit `54a62c7` with the same flags and
+seed as the earlier run. The same directory holds a same-host control at the
+parent commit `891a0f9`, which measured 8.102s p99 across 340 samples.
+
+The earlier run at the same scope, before restart fencing, measured 16.084s
+p99 across 282 samples and missed the target. Its summary stays in
+`results/chaos/20260815`. The cause was that a killed worker restarted within
+about a second, filled its free slots with backlog before its old leases
+expired, and left the requeued jobs waiting for the next completion wave.
 
 ## Known local port conflicts
 
@@ -420,8 +431,13 @@ The benchmark orchestrator can choose a free API port with `--host-port=0`.
 ## Optional follow-up work
 
 1. Raise benchmark median above 10,000 durable lease grants/min.
-2. Reduce recovery p99 below five seconds under the same chaos scope.
-3. Rerun qualification with identical flags after performance changes.
+2. Rerun the full qualification with identical flags so the combined summary
+   reflects restart fencing.
+3. Find why heartbeats stop extending leases mid-payload at the 5,000-job
+   scope. Both the fenced run and its control repeat more than one attempt
+   per job (5,764 and 6,618 repeats), almost all from lease expiry rather
+   than worker kills. Correctness holds, but every repeat re-executes a
+   payload and spends a slot.
 4. Replace the measured-miss evidence only after the new set validates.
 
 ## Final evidence command

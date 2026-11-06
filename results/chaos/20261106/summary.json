@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "evidence_valid": true,
+  "source_commit": "54a62c7",
+  "supersedes": "results/chaos/20260815",
+  "host": {
+    "cpu": "Apple M4",
+    "logical_cpus": 10,
+    "memory_gib": 16,
+    "docker_engine": "28.0.4 linux/arm64 (Docker Desktop)",
+    "compose": "v2.34.0-desktop.1"
+  },
+  "scope": {
+    "runs": 1,
+    "jobs": 5000,
+    "worker_kills": 20,
+    "server_kills": 1,
+    "seed": 26081401,
+    "payload_duration": "10s",
+    "action_window": "100ms to 500ms"
+  },
+  "correctness": {
+    "reconciliation_passed": true,
+    "lost": 0,
+    "duplicate_canonical_outcomes": 0,
+    "attempt_repeats": 5764
+  },
+  "recovery": {
+    "samples": 296,
+    "p99_ns": 639607796,
+    "target_exclusive_ns": 5000000000,
+    "target_met": true
+  },
+  "status": "target_met",
+  "same_host_control": {
+    "source_commit": "891a0f9",
+    "directory": "control-891a0f9",
+    "reconciliation_passed": true,
+    "attempt_repeats": 6618,
+    "recovery_samples": 340,
+    "recovery_p99_ns": 8101804629,
+    "target_met": false
+  }
+}

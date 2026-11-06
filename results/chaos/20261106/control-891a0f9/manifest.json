@@ -1,0 +1,29 @@
+{
+  "version": 3,
+  "run": 1,
+  "seed": 26081401,
+  "project": "railyard-baseline-chaos-r01-s18df879",
+  "tenant_id": "chaos-r01-s18df879",
+  "queue": "noop",
+  "jobs": 5000,
+  "workers": [
+    "worker-1",
+    "worker-2",
+    "worker-3",
+    "worker-4",
+    "worker-5",
+    "worker-6",
+    "worker-7",
+    "worker-8"
+  ],
+  "worker_kills": 20,
+  "submit_concurrency": 16,
+  "job_duration": 10000000000,
+  "server_kill_target": 0.5650662125360878,
+  "server_kill_target_jobs": 2826,
+  "max_recovery": 5000000000,
+  "compose_file": "deploy/compose.yaml",
+  "configuration_hash": "f9dafcab851096d7323b2559d9c61c805de75307a2ae29f602433e27641879f2",
+  "started_at": "2026-11-06T22:47:56.237912Z",
+  "completed_at": "2026-11-06T23:07:12.887831Z"
+}

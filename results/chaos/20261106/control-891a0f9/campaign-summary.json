@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "started_at": "2026-11-06T22:47:56.237778Z",
+  "completed_at": "2026-11-06T23:07:13.39615Z",
+  "passed": false,
+  "recovery_samples": 340,
+  "recovery_p99_ms": 8101.804629,
+  "recovery_target_ms": 5000,
+  "runs": [
+    {
+      "run": 1,
+      "seed": 26081401,
+      "project": "railyard-baseline-chaos-r01-s18df879",
+      "tenant_id": "chaos-r01-s18df879",
+      "started_at": "2026-11-06T22:47:56.237912Z",
+      "completed_at": "2026-11-06T23:07:12.906704Z",
+      "accepted": 5000,
+      "worker_kills": 20,
+      "server_kills": 1,
+      "recovery_samples": 340,
+      "recovery_p99_ms": 8101.804629,
+      "recovery_target_ms": 5000,
+      "reconciliation_pass": true,
+      "artifact_directory": "20261106T224756.237808000Z-r01-s18df879"
+    }
+  ]
+}

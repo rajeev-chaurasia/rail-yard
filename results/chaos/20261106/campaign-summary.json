@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "started_at": "2026-11-06T22:27:48.777103Z",
+  "completed_at": "2026-11-06T22:46:25.565916Z",
+  "passed": true,
+  "recovery_samples": 296,
+  "recovery_p99_ms": 639.607796,
+  "recovery_target_ms": 5000,
+  "runs": [
+    {
+      "run": 1,
+      "seed": 26081401,
+      "project": "railyard-qualification-chaos-r01-s18df879",
+      "tenant_id": "chaos-r01-s18df879",
+      "started_at": "2026-11-06T22:27:48.777444Z",
+      "completed_at": "2026-11-06T22:46:25.052108Z",
+      "accepted": 5000,
+      "worker_kills": 20,
+      "server_kills": 1,
+      "recovery_samples": 296,
+      "recovery_p99_ms": 639.607796,
+      "recovery_target_ms": 5000,
+      "reconciliation_pass": true,
+      "artifact_directory": "results/_work/chaos-qualification-20261106/20261106T222748.777348000Z-r01-s18df879"
+    }
+  ]
+}

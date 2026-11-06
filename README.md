@@ -59,7 +59,9 @@ The control plane owns all durable state.
 - SQLite runs in WAL mode with full synchronous durability. Sequence-ordered
   transactional writes prevent a restart from resurrecting settled state.
 - Workers hold fenced leases, heartbeat every second, and lose ownership when a
-  2.5-second lease expires.
+  2.5-second lease expires. A worker process that restarts under the same ID
+  registers a new incarnation, which requeues its predecessor's leases at once
+  instead of after expiry.
 - Triggers come from upstream DAG completion, durable cron occurrences, and a
   Redis Streams consumer group.
 - Retries use bounded exponential backoff around 2 s, 4 s, 8 s, and 16 s with
@@ -206,7 +208,10 @@ If a result misses a target, the measured number will be published unchanged.
 
 ## Measured portfolio results
 
-Evidence set: [results/qualification/20260815](results/qualification/20260815)
+Evidence sets: [results/qualification/20260815](results/qualification/20260815)
+for throughput, replay, operations, and SLO rules, and
+[results/chaos/20261106](results/chaos/20261106) for chaos correctness and
+recovery.
 
 1. **Throughput:** three measured 5,000-job runs produced a median of
    **9,807.35 durable lease grants/min** on one host with eight worker
@@ -214,8 +219,23 @@ Evidence set: [results/qualification/20260815](results/qualification/20260815)
 2. **Chaos correctness:** one seeded 5,000-job run with 20 worker kills and one
    server kill reconciled with **zero lost** and **zero duplicate canonical
    outcomes**.
-3. **Recovery:** **16.084s p99** across 282 affected-lease samples. The
-   five-second target was missed.
+3. **Recovery:** **0.640s p99** across 296 affected-lease samples, below the
+   five-second target. The raw samples are committed with the summary. The
+   earlier 16.084s p99 across 282 samples was measured before restart
+   fencing, with identical chaos flags and seed, and is kept in
+   [results/chaos/20260815](results/chaos/20260815). A same-host control on
+   the parent commit, also committed, measured **8.102s p99** across 340
+   samples, so the change is isolated from the host difference.
+
+   | Commit | Restart fencing | Recovery p99 | Samples | Attempt repeats |
+   | --- | --- | --- | --- | --- |
+   | `891a0f9` (control) | no | 8.102s | 340 | 6,618 |
+   | `54a62c7` | yes | 0.640s | 296 | 5,764 |
+
+   Both runs repeat more than one attempt per job. Heartbeats stop extending
+   leases mid-payload under the 5,000-job load, which costs throughput and
+   payload executions but no canonical outcome. That churn predates restart
+   fencing, and its cause is not yet diagnosed.
 4. **Determinism:** three separate processes replayed 50,000 decisions with
    **100% byte match** and SHA-256
    `06ea0a236743ed4a9782879f9fff78242fd6e29da24ed78cc9c90e46a6376bdf`.
@@ -225,7 +245,11 @@ Evidence set: [results/qualification/20260815](results/qualification/20260815)
    tests.
 
 The evidence is valid, but the combined qualification status is a measured
-miss because throughput and recovery did not meet their targets.
+miss because throughput did not meet its target. The combined summary in
+`results/qualification/20260815` predates restart fencing and still records
+the old recovery miss. It was not regenerated, because its benchmark inputs
+are raw run directories that were never committed. The 20261106 chaos run used
+a different host than the 20260815 set, which its summary records.
 
 ## Technology
 

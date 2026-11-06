@@ -16,6 +16,17 @@ No committed throughput or chaos directory currently satisfies the
 qualification contract. Content under `results/_work/` is scratch output and
 must not be cited as a published result.
 
+`results/chaos/20261106` holds the chaos run measured after restart fencing,
+at commit `54a62c7` with the qualification flags and seed `26081401`. It
+commits the run manifest, reconciliation report, action trace, every recovery
+sample, and the campaign summary, so the recovery p99 can be recomputed by
+nearest rank from `recovery-samples.jsonl`. The database snapshot, Compose
+logs, and submitted records are not committed because of their size; their
+digests are kept in `run-SHA256SUMS`. Without them the release-audit reader
+cannot revalidate the run from the repository alone, which is why it does not
+satisfy the contract above. `control-891a0f9` holds the same files for an
+identical run on the same host at the parent commit, before restart fencing.
+
 The committed SLO summary at `results/slo/20260814T104500Z/summary.json`
 records deterministic promtool rule tests. It is not a complete P5 evidence
 directory by itself. The committed P5 walkthrough at

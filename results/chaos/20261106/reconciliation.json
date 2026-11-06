@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-06T22:46:25.026121Z",
+  "passed": true,
+  "expected_jobs": 5000,
+  "counts": {
+    "accepted": 5000,
+    "jobs": 5000,
+    "completions": 5000,
+    "attempts": 10764,
+    "attempt_repeats": 5764,
+    "events": 36846,
+    "idempotency_rows": 5000,
+    "active_jobs": 0,
+    "active_attempts": 0,
+    "slot_reservations": 0,
+    "state_counts": {
+      "SUCCEEDED": 5000
+    }
+  },
+  "checks": [
+    {
+      "name": "attempts_and_leases",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "canonical_ledger",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "dag",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "event_log",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "foreign_keys",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "idempotency",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "manifest",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "materialized_jobs",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "schema_migrations",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "slot_accounting",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "sqlite_integrity",
+      "passed": true,
+      "violations": 0
+    },
+    {
+      "name": "sqlite_settings",
+      "passed": true,
+      "violations": 0
+    }
+  ],
+  "violation_count": 0,
+  "violations": null,
+  "details_truncated": false,
+  "not_observable": [
+    "historical scheduler ordering and capacity peaks require decision records",
+    "stale request rejection and duplicate HTTP receipt semantics require protocol traces",
+    "graph immutability requires historical snapshots",
+    "Redis acknowledgement ordering requires transport traces",
+    "payload side effects require a cooperative idempotency target"
+  ]
+}
