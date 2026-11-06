@@ -96,7 +96,9 @@ func run() error {
 	if err := compose(ctx, value, "kill", "-s", "SIGKILL", "worker-1"); err != nil {
 		return err
 	}
-	if err := compose(ctx, value, "up", "-d", "worker-1"); err != nil {
+	// Without --no-deps, Compose on the GitHub runner recreates redis and the
+	// server here, and the measured recovery becomes a full stack restart.
+	if err := compose(ctx, value, "up", "-d", "--no-deps", "worker-1"); err != nil {
 		return err
 	}
 	var recovery time.Duration
